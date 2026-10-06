@@ -1,0 +1,34 @@
+CMakeFiles/studyquest.dir/src/main.c.o: \
+ /home/lacruz/Documents/dev/studyquest/src/main.c \
+ /nix/store/h0ip0h6qp7kc2wm7mwjaglkxxbzmjri4-glibc-2.42-51-dev/include/stdc-predef.h \
+ /nix/store/jmmjfp58zbfxfrql5vq8444lrc12bxiz-raylib-5.5-unstable-2026-01-20/include/raylib.h \
+ /nix/store/lvwga6ivl1d4lnw0zis9ajs0rqx9gp4i-gcc-15.2.0/lib/gcc/x86_64-unknown-linux-gnu/15.2.0/include/stdarg.h \
+ /nix/store/lvwga6ivl1d4lnw0zis9ajs0rqx9gp4i-gcc-15.2.0/lib/gcc/x86_64-unknown-linux-gnu/15.2.0/include/stdbool.h \
+ /home/lacruz/Documents/dev/studyquest/src/core/app.h \
+ /home/lacruz/Documents/dev/studyquest/src/storage/save.h \
+ /nix/store/lvwga6ivl1d4lnw0zis9ajs0rqx9gp4i-gcc-15.2.0/lib/gcc/x86_64-unknown-linux-gnu/15.2.0/include/stddef.h \
+ /home/lacruz/Documents/dev/studyquest/src/cards/cards.h \
+ /nix/store/lvwga6ivl1d4lnw0zis9ajs0rqx9gp4i-gcc-15.2.0/lib/gcc/x86_64-unknown-linux-gnu/15.2.0/include/stdint.h \
+ /nix/store/h0ip0h6qp7kc2wm7mwjaglkxxbzmjri4-glibc-2.42-51-dev/include/stdint.h \
+ /nix/store/h0ip0h6qp7kc2wm7mwjaglkxxbzmjri4-glibc-2.42-51-dev/include/bits/libc-header-start.h \
+ /nix/store/h0ip0h6qp7kc2wm7mwjaglkxxbzmjri4-glibc-2.42-51-dev/include/features.h \
+ /nix/store/h0ip0h6qp7kc2wm7mwjaglkxxbzmjri4-glibc-2.42-51-dev/include/features-time64.h \
+ /nix/store/h0ip0h6qp7kc2wm7mwjaglkxxbzmjri4-glibc-2.42-51-dev/include/bits/wordsize.h \
+ /nix/store/h0ip0h6qp7kc2wm7mwjaglkxxbzmjri4-glibc-2.42-51-dev/include/bits/timesize.h \
+ /nix/store/h0ip0h6qp7kc2wm7mwjaglkxxbzmjri4-glibc-2.42-51-dev/include/sys/cdefs.h \
+ /nix/store/h0ip0h6qp7kc2wm7mwjaglkxxbzmjri4-glibc-2.42-51-dev/include/bits/long-double.h \
+ /nix/store/h0ip0h6qp7kc2wm7mwjaglkxxbzmjri4-glibc-2.42-51-dev/include/gnu/stubs.h \
+ /nix/store/h0ip0h6qp7kc2wm7mwjaglkxxbzmjri4-glibc-2.42-51-dev/include/gnu/stubs-64.h \
+ /nix/store/h0ip0h6qp7kc2wm7mwjaglkxxbzmjri4-glibc-2.42-51-dev/include/bits/types.h \
+ /nix/store/h0ip0h6qp7kc2wm7mwjaglkxxbzmjri4-glibc-2.42-51-dev/include/bits/typesizes.h \
+ /nix/store/h0ip0h6qp7kc2wm7mwjaglkxxbzmjri4-glibc-2.42-51-dev/include/bits/time64.h \
+ /nix/store/h0ip0h6qp7kc2wm7mwjaglkxxbzmjri4-glibc-2.42-51-dev/include/bits/wchar.h \
+ /nix/store/h0ip0h6qp7kc2wm7mwjaglkxxbzmjri4-glibc-2.42-51-dev/include/bits/stdint-intn.h \
+ /nix/store/h0ip0h6qp7kc2wm7mwjaglkxxbzmjri4-glibc-2.42-51-dev/include/bits/stdint-uintn.h \
+ /nix/store/h0ip0h6qp7kc2wm7mwjaglkxxbzmjri4-glibc-2.42-51-dev/include/bits/stdint-least.h \
+ /home/lacruz/Documents/dev/studyquest/src/player/player.h \
+ /home/lacruz/Documents/dev/studyquest/src/player/achievements.h \
+ /home/lacruz/Documents/dev/studyquest/src/study/scheduler.h \
+ /home/lacruz/Documents/dev/studyquest/src/core/fonts.h \
+ /home/lacruz/Documents/dev/studyquest/src/core/anim.h \
+ /home/lacruz/Documents/dev/studyquest/src/core/theme.h

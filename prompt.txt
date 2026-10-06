@@ -1,0 +1,446 @@
+The UI, fonts, animations, study flow, and back button are now in a good state.
+
+Do NOT redesign those systems.
+
+I want the next major feature to be the **deck import system**, with proper support for **Anki `.apkg` files**.
+
+The current import functionality does not work correctly, so this needs to be treated as a real data-import feature rather than simply adding another file extension to the existing importer.
+
+# Primary goal
+
+I want to be able to take a normal Anki deck:
+
+```
+example.apkg
+```
+
+and import it directly into StudyQuest.
+
+The imported deck should appear as a normal StudyQuest deck and should be immediately usable in the existing study system.
+
+The user should NOT need to convert the `.apkg` into CSV, JSON, or another format first.
+
+---
+
+# Important: understand the APKG format properly
+
+Before implementing anything, inspect the current Anki package format and design the importer around the actual structure.
+
+An `.apkg` is a packaged Anki deck. It can contain:
+
+* decks
+* notes
+* cards
+* note types
+* card templates
+* scheduling/review information
+* tags
+* media such as images and audio
+
+Anki's current export documentation describes `.apkg` as a deck package and notes that a package can contain cards, notes, note types, and media.
+
+There are also legacy and modern package variants.
+
+Do NOT assume every APKG contains only:
+
+```
+collection.anki2
+```
+
+A modern package may contain:
+
+```
+collection.anki21
+```
+
+and the older `collection.anki2` may be a compatibility/dummy database.
+
+Your importer must recognize and handle the package variant instead of failing simply because `collection.anki2` contains no useful cards.
+
+---
+
+# 1. Build a real APKG importer
+
+Create a dedicated module for Anki package importing.
+
+Do not put APKG parsing directly into the UI.
+
+Conceptually:
+
+```
+src/import/
+    import_manager.c
+    import_manager.h
+    apkg_importer.c
+    apkg_importer.h
+    anki_parser.c
+    anki_parser.h
+    media_importer.c
+    media_importer.h
+```
+
+The exact structure may differ according to the current project architecture.
+
+Responsibilities should be separated.
+
+For example:
+
+APKG importer:
+Open package
+Validate package
+Extract contents
+Locate Anki collection data
+Parse collection
+Parse decks
+Parse note types
+Parse notes
+Parse cards
+Parse media
+Convert into StudyQuest objects
+
+StudyQuest database/storage:
+Store imported objects
+
+UI:
+Display progress/errors/results
+
+Do not mix all three responsibilities.
+
+---
+
+# 2. APKG is usually a ZIP container
+
+Treat the `.apkg` as an archive.
+
+The importer should:
+
+1. Open the package.
+2. Validate that it is a usable archive.
+3. Inspect its contents.
+4. Locate the collection database.
+5. Extract the database to a temporary location.
+6. Open it using SQLite where appropriate.
+7. Parse the database.
+8. Extract media.
+9. Convert the contents into StudyQuest's internal representation.
+10. Save the imported deck.
+
+Do not assume file ordering.
+
+Do not assume filenames beyond the actual package format.
+
+Do not blindly extract everything into the permanent user data directory.
+
+Use a temporary import directory and clean it up afterward.
+
+---
+
+# 3. Support modern and legacy APKG packages
+
+This is mandatory.
+
+The importer should recognize cases involving files such as:
+
+```
+collection.anki2
+collection.anki21
+```
+
+and determine which collection data is actually usable.
+
+Do not simply try `collection.anki2` and declare the package corrupt if it contains the compatibility placeholder.
+
+Modern Anki packages can use compressed collection data.
+
+Handle the relevant compression format correctly rather than assuming the database is always an ordinary SQLite file.
+
+If the required compression/archive libraries are not currently available, add an appropriate lightweight dependency rather than implementing a fragile custom decompressor.
+
+Document the dependency.
+
+---
+
+# 4. Use SQLite correctly
+
+Anki's collection data is SQLite-based.
+
+Do NOT modify the source APKG's database.
+
+Extract it and open it read-only where practical.
+
+Use SQLite queries to retrieve:
+
+* decks
+* note types
+* notes
+* cards
+* review/scheduling information where available
+
+Do not depend on undocumented row ordering.
+
+Use prepared statements.
+
+Check every SQLite error.
+
+Always finalize statements and close databases.
+
+---
+
+# 5. Parse Anki decks properly
+
+An APKG can represent more than a simplistic single deck.
+
+Import:
+
+* deck name
+* deck hierarchy
+* child decks
+* deck IDs where appropriate
+* deck settings where useful
+
+If the package contains something like:
+
+```
+Japanese
+    Japanese::Vocabulary
+    Japanese::Kanji
+    Japanese::Grammar
+```
+
+preserve the hierarchy when StudyQuest supports it.
+
+If StudyQuest currently does not support hierarchical decks, implement the cleanest compatible representation rather than silently flattening everything without explanation.
+
+---
+
+# 6. Parse notes and cards separately
+
+Understand that Anki distinguishes:
+
+NOTE
+
+and
+
+CARD
+
+Do not assume:
+
+one row = one flashcard.
+
+A single note can generate multiple cards through card templates.
+
+For example, a note could contain:
+
+```
+Front: 食べる
+Reading: たべる
+Meaning: to eat
+```
+
+and generate:
+
+```
+Japanese → English
+```
+
+and:
+
+```
+English → Japanese
+```
+
+depending on its templates.
+
+Your importer should preserve this relationship as much as the existing StudyQuest data model allows.
+
+---
+
+# 7. Preserve note fields
+
+Do not only import the first two text fields.
+
+Anki notes can contain multiple fields.
+
+For example:
+
+```
+Expression
+Reading
+Meaning
+Example
+Audio
+Notes
+```
+
+The importer should inspect the note type's field definitions and map the data intelligently.
+
+At minimum, preserve all field data somewhere so information is not silently destroyed.
+
+---
+
+# 8. Japanese support is extremely important
+
+This application is specifically intended for Japanese learning.
+
+The importer MUST preserve UTF-8 Japanese text.
+
+Test with:
+
+```
+こんにちは
+おはよう
+ありがとう
+食べる
+学生
+日本語
+日本語を勉強しています。
+```
+
+Do not corrupt:
+
+* hiragana
+* katakana
+* kanji
+* Japanese punctuation
+* combining characters
+* other Unicode text
+
+The existing Japanese-capable font system must continue to render imported content correctly.
+
+---
+
+# 9. Support HTML from Anki cards
+
+Anki card fields commonly contain HTML formatting.
+
+Do not simply strip all HTML.
+
+Preserve useful formatting such as:
+
+* `<b>`
+* `<strong>`
+* `<i>`
+* `<em>`
+* `<u>`
+* `<br>`
+* paragraphs
+* lists
+* basic spans/styles where practical
+
+StudyQuest is a raylib application, so it obviously does not need to implement a complete web browser.
+
+Instead, build a small HTML-to-renderable-content layer appropriate for flashcards.
+
+At minimum, correctly handle the common formatting used in normal Anki decks.
+
+Do not render raw HTML tags directly to the user.
+
+---
+
+# 10. Support Anki media
+
+This is extremely important.
+
+Anki packages can contain:
+
+* images
+* audio
+* other media
+
+The package includes a media mapping.
+
+The importer must understand that mapping rather than assuming the numeric archive filenames are the actual filenames displayed to the user.
+
+For example, an archive may contain files named:
+
+```
+0
+1
+2
+3
+```
+
+while the media mapping identifies their original names.
+
+Restore the correct filenames when extracting media.
+
+---
+
+# 11. Images inside cards
+
+If an imported card contains something like an image reference:
+
+```
+<img src="example.png">
+```
+
+the imported StudyQuest card should display the image when possible.
+
+Map the imported media to StudyQuest's asset/media storage.
+
+Do not merely import the text:
+
+```
+<img src="example.png">
+```
+
+and display that literal string.
+
+The actual image should appear in the study card.
+
+---
+
+# 12. Audio inside cards
+
+Support common Anki audio references such as:
+
+```
+[sound:audio.mp3]
+```
+
+When an imported card contains audio:
+
+* import the audio file
+* resolve the reference
+* allow the StudyQuest study screen to play it
+
+Add a small audio control where appropriate.
+
+This is particularly useful for Japanese learning because pronunciation/audio is often part of a deck.
+
+Do not automatically play every piece of audio repeatedly unless that matches the current card behavior.
+
+---
+
+# 13. Preserve tags
+
+Import Anki tags.
+
+Examples:
+
+```
+jlpt-n5
+kanji
+vocabulary
+grammar
+chapter-3
+```
+
+Store them in StudyQuest.
+
+The user should be able to use the tags for filtering/searching if the current application architecture supports it.
+
+Do not silently discard them.
+
+---
+
+# 14. Card scheduling
+
+This needs careful handling.
+
+Anki decks can contain scheduling/review information.
+
+The importer should inspect whether the APKG contains scheduling information.
+
+If scheduling data is present:
+
