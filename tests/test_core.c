@@ -13,6 +13,10 @@
     else printf("ok: %s\n", #cond); \
 } while (0)
 
+/* ------------------------------------------------------------------ */
+/*  Scheduler                                                          */
+/* ------------------------------------------------------------------ */
+
 static void test_scheduler_new_card(void) {
     Card c = {0};
     c.state = CARD_NEW;
@@ -31,9 +35,9 @@ static void test_scheduler_review_card(void) {
     c.interval_sec = 4 * 86400.0;
     double now = 1000000.0;
 
-    double good = scheduler_next_interval(&c, RATING_GOOD, now);
-    double easy = scheduler_next_interval(&c, RATING_EASY, now);
-    double hard = scheduler_next_interval(&c, RATING_HARD, now);
+    double good  = scheduler_next_interval(&c, RATING_GOOD,  now);
+    double easy  = scheduler_next_interval(&c, RATING_EASY,  now);
+    double hard  = scheduler_next_interval(&c, RATING_HARD,  now);
     double again = scheduler_next_interval(&c, RATING_AGAIN, now);
 
     CHECK(good > hard);
@@ -59,6 +63,10 @@ static void test_scheduler_apply(void) {
     CHECK(c.state == CARD_RELEARNING);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Progression                                                        */
+/* ------------------------------------------------------------------ */
+
 static void test_xp_progression(void) {
     Player p; player_init(&p);
 
@@ -80,12 +88,20 @@ static void test_xp_progression(void) {
     CHECK(p.xp == 25);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Quests                                                             */
+/* ------------------------------------------------------------------ */
+
 static void test_quest_roll(void) {
     Player p; player_init(&p);
     player_roll_daily_quests(&p, 12345);
     CHECK(p.quests[0].target > 0);
     CHECK(!p.quests[0].complete);
 }
+
+/* ------------------------------------------------------------------ */
+/*  Achievements                                                       */
+/* ------------------------------------------------------------------ */
 
 static void test_achievement_unlock(void) {
     Player p; player_init(&p);
@@ -97,15 +113,17 @@ static void test_achievement_unlock(void) {
     CHECK(p.achievements[ACH_STUDY_100].unlocked == false || p.total_studied >= 100);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Sample deck                                                        */
+/* ------------------------------------------------------------------ */
+
 static void test_deck_sample(void) {
     /* DeckList is large; keep it out of the stack frame. */
     static DeckList dl;
     decklist_init_sample(&dl);
 
-    /* Two sample decks ship by default: C Programming + Japanese N5. */
     CHECK(dl.count == 2);
 
-    /* Locate the C deck by name rather than relying on index. */
     Deck *cdeck = NULL;
     Deck *jdeck = NULL;
     for (int i = 0; i < dl.count; i++) {
@@ -118,12 +136,12 @@ static void test_deck_sample(void) {
     CHECK(cdeck->card_count >= 15);
     CHECK(jdeck->card_count >= 4);
 
-    /* All cards in a fresh deck should be due immediately. */
     double now = (double)time(NULL);
     CHECK(deck_due_count(cdeck, now) == cdeck->card_count);
     CHECK(deck_due_count(jdeck, now) == jdeck->card_count);
 
-    /* The Japanese deck should have real CJK content, not empty fields. */
+    /* Every Japanese card should be identified as such and carry a
+       Word field whose value contains CJK. */
     if (jdeck) {
         int jp_cards = 0;
         for (int i = 0; i < jdeck->card_count; i++) {
@@ -131,15 +149,16 @@ static void test_deck_sample(void) {
         }
         CHECK(jp_cards == jdeck->card_count);
 
-        /* Verify at least one card carries the exact strings we ship. */
         int found_konnichiwa = 0;
         int found_taberu      = 0;
         int found_gakusei     = 0;
         for (int i = 0; i < jdeck->card_count; i++) {
             const Card *c = &jdeck->cards[i];
-            if (strcmp(c->japanese, "こんにちは") == 0) found_konnichiwa = 1;
-            if (strcmp(c->japanese, "食べる")     == 0) found_taberu      = 1;
-            if (strcmp(c->japanese, "学生")       == 0) found_gakusei     = 1;
+            const char *word = card_find_field(c, "Word");
+            if (!word) continue;
+            if (strcmp(word, "こんにちは") == 0) found_konnichiwa = 1;
+            if (strcmp(word, "食べる")     == 0) found_taberu      = 1;
+            if (strcmp(word, "学生")       == 0) found_gakusei     = 1;
         }
         CHECK(found_konnichiwa);
         CHECK(found_taberu);
@@ -147,11 +166,15 @@ static void test_deck_sample(void) {
     }
 }
 
+/* ------------------------------------------------------------------ */
+/*  Streak                                                             */
+/* ------------------------------------------------------------------ */
+
 static void test_streak(void) {
     Player p; player_init(&p);
 
-    /* refresh_daily() uses the real clock, so pin today_day to the real day
-       to keep it from clobbering our simulated values. */
+    /* refresh_daily() uses the real clock, so pin today_day to the real
+       day to keep it from clobbering our simulated values. */
     int64_t today = (int64_t)(time(NULL) / 86400);
     p.today_day = today;
 
@@ -173,6 +196,10 @@ static void test_streak(void) {
     player_on_review(&p, 2, true);
     CHECK(p.streak == 1);
 }
+
+/* ------------------------------------------------------------------ */
+/*  Main                                                               */
+/* ------------------------------------------------------------------ */
 
 int main(void) {
     printf("== scheduler ==\n");

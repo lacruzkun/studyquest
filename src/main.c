@@ -5,6 +5,7 @@
 int main(void) {
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT);
     InitWindow(1280, 720, "StudyQuest");
+    InitAudioDevice();
     SetTargetFPS(60);
     SetExitKey(KEY_NULL); /* we handle Escape ourselves */
     SetRandomSeed((unsigned int)GetTime() * 1000);
@@ -22,6 +23,7 @@ int main(void) {
     }
 
     app_destroy(app);
+    CloseAudioDevice();
     CloseWindow();
     return 0;
 }

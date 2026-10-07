@@ -1,13 +1,19 @@
 #include "screens.h"
 #include "core/theme.h"
 #include "core/anim.h"
+#include "core/assets.h"
 #include "ui/ui.h"
 #include "study/scheduler.h"
 #include "rlgl.h"
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <time.h>
 #include <math.h>
+
+/* ------------------------------------------------------------------ */
+/*  Local UI state                                                     */
+/* ------------------------------------------------------------------ */
 
 typedef enum {
     PHASE_ENTER = 0,
@@ -25,7 +31,7 @@ typedef struct StudyUI {
     int        queued_rating;
 
     /* Card motion */
-    float enter_x;         /* + = off-screen right */
+    float enter_x;
     float enter_alpha;
     float exit_x, exit_y, exit_rot, exit_alpha;
     int   exit_dir_x, exit_dir_y;
@@ -33,8 +39,9 @@ typedef struct StudyUI {
     /* Mouse tilt */
     float tilt_x, tilt_y;
 
-    /* Reveal stagger */
-    float rev_word, rev_reading, rev_divider, rev_meaning, rev_example;
+    /* Reveal stagger — one value per field, plus the divider. */
+    float rev_field[MAX_FIELDS];
+    float rev_divider;
 
     /* Button springs */
     Spring btn_scale[4];
@@ -64,7 +71,9 @@ void study_reset_ui(void) {
     S.enter_alpha = 0.f;
 }
 
-/* ---------------- helpers ---------------- */
+/* ------------------------------------------------------------------ */
+/*  Helpers                                                            */
+/* ------------------------------------------------------------------ */
 
 static void rating_reward(Rating r, int *xp, int *coins) {
     switch (r) {
@@ -86,7 +95,6 @@ static void recompute_mature(App *a) {
     a->data.player.mature_cards = n;
 }
 
-/* Button row geometry shared by update and draw */
 static void rating_button_rects(int W, int H, Rectangle out[4]) {
     float bw = 160.f, gap = 18.f;
     float total = bw * 4.f + gap * 3.f;
@@ -124,15 +132,13 @@ static void set_phase(App *a, StudyPhase p) {
     if (p == PHASE_ENTER) {
         S.enter_x = 520.f;
         S.enter_alpha = 0.f;
-        /* Reset exit state — otherwise the new card is drawn off-screen
-           at the previous card's final exit position. */
         S.exit_x = 0.f;
         S.exit_y = 0.f;
         S.exit_rot = 0.f;
         S.exit_alpha = 1.f;
     } else if (p == PHASE_REVEAL) {
-        S.rev_word = S.rev_reading = S.rev_divider = 0.f;
-        S.rev_meaning = S.rev_example = 0.f;
+        for (int i = 0; i < MAX_FIELDS; i++) S.rev_field[i] = 0.f;
+        S.rev_divider = 0.f;
     } else if (p == PHASE_RATED) {
         switch (S.queued_rating) {
             case 0: S.exit_dir_x = 0; S.exit_dir_y = 1; break;
@@ -143,7 +149,9 @@ static void set_phase(App *a, StudyPhase p) {
     }
 }
 
-/* ---------------- advance / rating ---------------- */
+/* ------------------------------------------------------------------ */
+/*  Advance / rating                                                   */
+/* ------------------------------------------------------------------ */
 
 static void advance(App *a) {
     StudySession *s = &a->session;
@@ -185,13 +193,11 @@ static void apply_rating_and_start_exit(App *a, int rating) {
         a->levelup_to = a->data.player.level;
         a->levelup_t = 2.6f;
         shake_add(&a->shake, 12.f);
-        /* Celebration burst at screen centre */
         particles_burst_ring(&a->particles,
             (Vector2){ GetScreenWidth()/2.f, GetScreenHeight()/2.f },
             40, TH.accent, 420.f, 1.1f, P_SHAPE_STAR, 8.f);
     }
 
-    /* Combo tracking */
     if (rating == RATING_AGAIN) {
         S.combo = 0;
     } else if (rating >= RATING_GOOD) {
@@ -201,7 +207,6 @@ static void apply_rating_and_start_exit(App *a, int rating) {
         spring_set(&S.combo_scale, 1.35f);
     }
 
-    /* Button position for particle + flight origin */
     Rectangle btns[4];
     rating_button_rects(GetScreenWidth(), GetScreenHeight(), btns);
     Vector2 emit = {
@@ -209,10 +214,8 @@ static void apply_rating_and_start_exit(App *a, int rating) {
         btns[rating].y + btns[rating].height/2.f
     };
 
-    /* Buttons respond */
     spring_snap(&S.btn_scale[rating], 0.86f);
 
-    /* Particles from button */
     Color col = rating_color(rating);
     particles_burst_shaped(&a->particles, emit, 28, col,
                            140.f, 380.f, 0.75f,
@@ -220,14 +223,12 @@ static void apply_rating_and_start_exit(App *a, int rating) {
     particles_burst_ring(&a->particles, emit, 14, col,
                          320.f, 0.5f, P_SHAPE_SPARK, 10.f);
 
-    /* Reward flight — travels to the top-right session XP counter */
     int W = GetScreenWidth();
     Vector2 target = { W - 52.f, 46.f };
     char txt[32];
     snprintf(txt, sizeof(txt), "+%d XP", xp);
     app_spawn_flight(a, emit, target, txt, TH.success);
 
-    /* Achievements */
     int newly[NUM_ACHIEVEMENTS];
     int n = player_check_achievements(&a->data.player, newly, NUM_ACHIEVEMENTS);
     if (n > 0) {
@@ -238,15 +239,15 @@ static void apply_rating_and_start_exit(App *a, int rating) {
     }
 
     app_save(a);
-
-    /* Card reaction shake — small */
     shake_add(&a->shake, rating == 0 ? 5.f : 2.f);
 
     S.queued_rating = rating;
     set_phase(a, PHASE_RATED);
 }
 
-/* ---------------- update ---------------- */
+/* ------------------------------------------------------------------ */
+/*  Update                                                             */
+/* ------------------------------------------------------------------ */
 
 void study_update(App *a, float dt) {
     StudySession *s = &a->session;
@@ -255,7 +256,6 @@ void study_update(App *a, float dt) {
 
     S.phase_t += dt;
 
-    /* Progress number pulse decay */
     if (S.prog_pulse > 0.f) {
         S.prog_pulse -= dt * 3.f;
         if (S.prog_pulse < 0.f) S.prog_pulse = 0.f;
@@ -265,11 +265,9 @@ void study_update(App *a, float dt) {
         if (S.combo_pulse < 0.f) S.combo_pulse = 0.f;
     }
 
-    /* Update button springs */
     for (int i = 0; i < 4; i++) spring_update(&S.btn_scale[i], dt);
     spring_update(&S.combo_scale, dt);
 
-    /* Mouse tilt */
     Vector2 m = GetMousePosition();
     float cx = GetScreenWidth()  / 2.f;
     float cy = GetScreenHeight() / 2.f - 60.f;
@@ -283,7 +281,6 @@ void study_update(App *a, float dt) {
     S.tilt_x += (tx * proximity - S.tilt_x) * anim_clamp01(dt * 8.f);
     S.tilt_y += (ty * proximity - S.tilt_y) * anim_clamp01(dt * 8.f);
 
-    /* Phase machine */
     switch (S.phase) {
         case PHASE_ENTER: {
             float p = anim_clamp01(S.phase_t / 0.42f);
@@ -301,11 +298,12 @@ void study_update(App *a, float dt) {
 
     if (S.phase == PHASE_REVEAL) {
         float t = S.phase_t;
-        S.rev_word    = ease_out_back(anim_clamp01((t - 0.02f) / 0.22f));
-        S.rev_reading = ease_out_back(anim_clamp01((t - 0.10f) / 0.22f));
+        for (int i = 1; i < MAX_FIELDS; i++) {
+            float start = 0.04f + (i - 1) * 0.09f;
+            S.rev_field[i] = ease_out_back(anim_clamp01((t - start) / 0.24f));
+        }
+        S.rev_field[0] = 1.f;
         S.rev_divider = ease_out_cubic(anim_clamp01((t - 0.14f) / 0.20f));
-        S.rev_meaning = ease_out_back(anim_clamp01((t - 0.18f) / 0.24f));
-        S.rev_example = ease_out_back(anim_clamp01((t - 0.30f) / 0.26f));
     }
 
     if (S.phase == PHASE_RATED) {
@@ -333,14 +331,12 @@ void study_update(App *a, float dt) {
         }
     }
 
-    /* Exit dialog catches all input */
     if (S.show_exit) {
         S.exit_dialog_t += dt;
         if (IsKeyPressed(KEY_ESCAPE)) { S.show_exit = false; return; }
         return;
     }
 
-    /* Back button + ESC */
     Rectangle back_btn = { 20, 20, 108, 36 };
     bool back_clicked = ui_button_hover(back_btn) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
     if (back_clicked || IsKeyPressed(KEY_ESCAPE)) {
@@ -351,7 +347,6 @@ void study_update(App *a, float dt) {
 
     if (S.phase == PHASE_ENTER || S.phase == PHASE_RATED) return;
 
-    /* Reveal */
     if (S.phase == PHASE_IDLE) {
         bool rk = IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_ENTER);
         bool rm = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
@@ -359,16 +354,18 @@ void study_update(App *a, float dt) {
             s->revealed = true;
             set_phase(a, PHASE_REVEAL);
             shake_add(&a->shake, 2.5f);
-            /* Small compression burst at the card */
             int W = GetScreenWidth(), H = GetScreenHeight();
             particles_burst_ring(&a->particles,
                 (Vector2){ W/2.f, H/2.f - 60.f },
                 10, TH.primary_hi, 120.f, 0.4f, P_SHAPE_SPARK, 6.f);
+
+            Card *cur = &d->cards[s->queue[s->current]];
+            if (cur->audio_ref[0])
+                assets_play_sound(&a->assets, cur->audio_ref);
         }
         return;
     }
 
-    /* Rating */
     int rating = -1;
     if (IsKeyPressed(KEY_ONE))   rating = RATING_AGAIN;
     if (IsKeyPressed(KEY_TWO))   rating = RATING_HARD;
@@ -384,7 +381,6 @@ void study_update(App *a, float dt) {
         S.btn_glow[i] += ((hover ? 1.f : 0.f) - S.btn_glow[i]) * anim_clamp01(dt * 7.f);
         if (hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
             rating = i;
-            /* Kick the spring so it dips immediately */
             spring_snap(&S.btn_scale[i], 0.86f);
             spring_set(&S.btn_scale[i], 1.0f);
         }
@@ -393,49 +389,69 @@ void study_update(App *a, float dt) {
     if (rating >= 0) apply_rating_and_start_exit(a, rating);
 }
 
-/* ---------------- draw ---------------- */
+/* ------------------------------------------------------------------ */
+/*  Draw helpers                                                       */
+/* ------------------------------------------------------------------ */
 
-static void draw_reveal_content(const Card *c, Rectangle card, float alpha) {
+static void draw_card_content(const Card *c, Rectangle card, float alpha) {
     bool jp = card_is_japanese(c);
     float W = card.width;
 
-    if (jp) {
-        /* Word has been drawn already in the front pass.
-         * Reading, divider, meaning, example animate in sequence. */
-        float reading_y = card.y + 40 + FONT_XL + 24;
-        if (S.rev_reading > 0.f) {
-            float yy = reading_y + (1.f - S.rev_reading) * 12.f;
-            ui_text_center(c->reading[0] ? c->reading : "",
-                (Rectangle){ card.x, yy, W, 30 },
-                FONT_MD, anim_color_alpha(TH.text_dim, alpha * S.rev_reading));
-        }
+    bool revealed = (S.phase == PHASE_REVEAL || S.phase == PHASE_RATED);
 
-        float div_y = reading_y + 42.f;
-        if (S.rev_divider > 0.f) {
-            float dw = (W - 200.f) * S.rev_divider;
-            float dx = card.x + W/2.f - dw/2.f;
-            DrawLineEx((Vector2){ dx, div_y }, (Vector2){ dx + dw, div_y },
-                       1.5f, anim_color_alpha((Color){ 80, 92, 128, 220 },
-                                              alpha * S.rev_divider));
-        }
+    const char *prompt = (c->field_count > 0) ? c->field_values[0] : c->front;
+    if (!prompt) prompt = "";
 
-        if (S.rev_meaning > 0.f) {
-            float yy = div_y + 14.f + (1.f - S.rev_meaning) * 14.f;
-            const char *mn = c->meaning[0] ? c->meaning : c->back;
-            ui_text_center(mn,
-                (Rectangle){ card.x, yy, W, 34 },
-                FONT_MD, anim_color_alpha(TH.text, alpha * S.rev_meaning));
-        }
+    if (jp && c->field_count > 0) {
+        float w_pop = (S.phase == PHASE_REVEAL)
+            ? ease_out_back(anim_clamp01(S.phase_t / 0.28f))
+            : 1.f;
+        int ws = (int)(FONT_XL * (0.82f + 0.18f * w_pop));
+        float wy = card.y + 40.f + (1.f - w_pop) * 14.f;
+        ui_text_center(prompt,
+            (Rectangle){ card.x, wy, W, (float)FONT_XL + 10 },
+            ws, anim_color_alpha(TH.text, alpha));
 
-        if (c->example[0] && S.rev_example > 0.f) {
-            float yy = div_y + 60.f + (1.f - S.rev_example) * 12.f;
-            ui_text_center(c->example,
-                (Rectangle){ card.x, yy, W, 26 },
-                FONT_SM, anim_color_alpha(TH.text_muted, alpha * S.rev_example));
+        if (!revealed) return;
+
+        float y = card.y + 40.f + FONT_XL + 24.f;
+        bool divider_drawn = false;
+
+        for (int i = 1; i < c->field_count; i++) {
+            if (!c->field_values[i][0]) continue;
+            float rev = S.rev_field[i];
+            if (rev <= 0.f) continue;
+
+            float ry = y + (1.f - rev) * 10.f;
+            int  sz  = (i == 1) ? FONT_MD : FONT_SM;
+            Color col = (i == 1) ? TH.text_dim : TH.text_muted;
+
+            ui_text_center(c->field_values[i],
+                (Rectangle){ card.x + 20, ry, W - 40, 32 },
+                sz, anim_color_alpha(col, alpha * rev));
+            y += 34.f;
+
+            if (i == 1 && !divider_drawn && S.rev_divider > 0.f) {
+                float dw = (W - 200.f) * S.rev_divider;
+                float dx = card.x + W/2.f - dw/2.f;
+                DrawLineEx((Vector2){ dx, y }, (Vector2){ dx + dw, y },
+                           1.5f, anim_color_alpha((Color){ 80, 92, 128, 220 },
+                                                  alpha * S.rev_divider));
+                y += 14.f;
+                divider_drawn = true;
+            }
         }
     } else {
-        /* Non-Japanese: divider then wrapped answer */
-        float div_y = card.y + card.height * 0.42f;
+        float prompt_bottom = ui_text_rich_ex(prompt,
+            (Rectangle){ card.x + 44, card.y + 40, W - 88, 200 },
+            FONT_MD, anim_color_alpha(TH.text, alpha), 8);
+
+        if (!revealed) return;
+
+        float div_y = prompt_bottom + 16.f;
+        float min_div = card.y + 200.f;
+        if (div_y < min_div) div_y = min_div;
+
         if (S.rev_divider > 0.f) {
             float dw = (W - 100.f) * S.rev_divider;
             float dx = card.x + W/2.f - dw/2.f;
@@ -443,14 +459,35 @@ static void draw_reveal_content(const Card *c, Rectangle card, float alpha) {
                        1.f, anim_color_alpha((Color){ 80, 92, 128, 220 },
                                              alpha * S.rev_divider));
         }
-        if (S.rev_meaning > 0.f) {
-            ui_text_wrapped(c->back,
-                (Rectangle){ card.x + 44, div_y + 20 + (1.f - S.rev_meaning) * 16.f,
-                             W - 88, card.height - (div_y - card.y) - 40.f },
-                FONT_MD, anim_color_alpha(TH.text_dim, alpha * S.rev_meaning), 8);
+
+        float y = div_y + 18.f;
+        for (int i = 1; i < c->field_count; i++) {
+            if (!c->field_values[i][0]) continue;
+            float rev = S.rev_field[i];
+            if (rev <= 0.f) continue;
+
+            float ry = y + (1.f - rev) * 10.f;
+
+            const char *fname = c->field_names[i];
+            if (fname && fname[0] && strcasecmp(fname, "Back") != 0) {
+                ui_text(fname,
+                    (int)card.x + 44, (int)ry, FONT_XS,
+                    anim_color_alpha(TH.text_muted, alpha * rev));
+                ry += 20.f;
+            }
+
+            float bottom = ui_text_rich_ex(c->field_values[i],
+                (Rectangle){ card.x + 44, ry, W - 88, 200 },
+                FONT_SM, anim_color_alpha(TH.text_dim, alpha * rev), 6);
+
+            y = bottom + 12.f;
         }
     }
 }
+
+/* ------------------------------------------------------------------ */
+/*  Draw                                                               */
+/* ------------------------------------------------------------------ */
 
 void study_draw(App *a) {
     StudySession *s = &a->session;
@@ -461,7 +498,6 @@ void study_draw(App *a) {
     int W = GetScreenWidth(), H = GetScreenHeight();
     double now = (double)time(NULL);
 
-    /* Ambient background */
     anim_draw_ambient_bg(W, H, (float)GetTime());
 
     /* -------- Back / Exit button -------- */
@@ -478,7 +514,6 @@ void study_draw(App *a) {
     /* -------- Header -------- */
     ui_text(d->name, 148, 26, FONT_MD, TH.text);
 
-    /* Progress counter — pulse when the pulse value is high */
     char prog[32];
     snprintf(prog, sizeof(prog), "%d / %d", s->current + 1, s->queue_len);
     int base_size = FONT_MD;
@@ -487,7 +522,6 @@ void study_draw(App *a) {
     int tw = ui_measure(prog, prog_size);
     ui_text(prog, W - tw - 24, 26 - (prog_size - base_size)/2, prog_size, prog_col);
 
-    /* Session XP counter (flight target) — pulses when a flight arrives */
     float pulse = a->xp_pulse;
     int xp_size = FONT_SM + (int)(6.f * pulse);
     Color xp_col = anim_color_lerp(TH.success, TH.accent, pulse);
@@ -496,33 +530,32 @@ void study_draw(App *a) {
     int xpw = ui_measure(xpbuf, xp_size);
     ui_text(xpbuf, W - tw - 40 - xpw, 32 - (xp_size - FONT_SM)/2, xp_size, xp_col);
 
-    /* -------- Card -------- */
+    /* -------- Card geometry -------- */
     Card *c = &d->cards[s->queue[s->current]];
     bool jp = card_is_japanese(c);
+    bool has_image = (c->image_ref[0] != 0);
 
     float cw = jp ? 780.f : 740.f;
     if (cw > W - 80) cw = W - 80;
 
-    /* Card height depends on phase */
-    float base_front_h = jp ? 300.f : 260.f;
+    float image_slot_h = has_image ? 200.f : 0.f;
+
+    float base_front_h = (jp ? 300.f : 260.f) + image_slot_h;
     float reveal_h = jp ? 260.f : 320.f;
+    if (c->field_count > 3) reveal_h += (c->field_count - 3) * 26.f;
     float total_h = base_front_h + (s->revealed ? reveal_h : 0.f);
 
-    /* Center of the card */
     float cx = W/2.f + S.enter_x + S.exit_x + S.tilt_x * 14.f;
     float cy = H/2.f - 90.f + S.exit_y + S.tilt_y * 12.f;
 
-    /* Scale by phase */
     float scale = 1.f;
     if (S.phase == PHASE_ENTER) {
         float p = anim_clamp01(S.phase_t / 0.42f);
         float e = ease_out_back(p);
         scale = 0.82f + 0.18f * e;
     } else if (S.phase == PHASE_REVEAL) {
-        /* Compression on reveal, then settle */
         float p = anim_clamp01(S.phase_t / 0.35f);
         scale = 1.f - 0.05f * (1.f - ease_out_cubic(p));
-        /* Add a small overshoot bump */
         scale += 0.015f * sinf(p * PI * 2.f) * (1.f - p);
     } else if (S.phase == PHASE_RATED) {
         float p = anim_clamp01(S.phase_t / 0.46f);
@@ -538,51 +571,57 @@ void study_draw(App *a) {
     float ch_s = total_h * scale;
     Rectangle card = { cx - cw_s/2.f, cy - ch_s/2.f, cw_s, ch_s };
 
-    /* Draw rotated via rlgl. Text drawn inside inherits the transform. */
     rlPushMatrix();
     rlTranslatef(card.x + card.width/2.f, card.y + card.height/2.f, 0.f);
     rlRotatef(rot, 0.f, 0.f, 1.f);
     rlTranslatef(-(card.x + card.width/2.f), -(card.y + card.height/2.f), 0.f);
 
-    /* Shadow */
     Rectangle sh = card; sh.x += 10.f; sh.y += 14.f;
     ui_panel(sh, (Color){ 0, 0, 0, (unsigned char)(110 * alpha) }, RADIUS_LG);
 
-    /* Body */
     ui_panel_gradient(card,
                       anim_color_alpha(TH.panel_hi, alpha),
                       anim_color_alpha(TH.panel,    alpha),
                       RADIUS_LG);
 
-    /* Border glow as reveal progresses */
     Color border = TH.border_hi;
-    if (S.rev_word > 0.f)
-        border = anim_color_lerp(border, TH.primary_hi, S.rev_word * 0.6f);
+    if (S.rev_divider > 0.f)
+        border = anim_color_lerp(border, TH.primary_hi, S.rev_divider * 0.6f);
     ui_outline(card, 0.14f, 12, 2.f, anim_color_alpha(border, alpha));
 
-    /* --- Card content --- */
-    if (jp) {
-        /* Japanese word — dominant, springs in */
-        float w_pop = S.phase == PHASE_ENTER ? 1.f
-                    : S.phase == PHASE_REVEAL ? ease_out_back(anim_clamp01(S.phase_t / 0.28f))
-                    : 1.f;
-        int ws = (int)(FONT_XL * (0.82f + 0.18f * w_pop));
-        const char *word = c->japanese[0] ? c->japanese : c->front;
-        float wy = card.y + 40.f + (1.f - w_pop) * 14.f;
-        ui_text_center(word,
-            (Rectangle){ card.x, wy, card.width, (float)FONT_XL + 10 },
-            ws, anim_color_alpha(TH.text, alpha));
-    } else {
-        ui_text_wrapped(c->front,
-            (Rectangle){ card.x + 44, card.y + 40, card.width - 88, 140 },
-            FONT_MD, anim_color_alpha(TH.text, alpha), 8);
+    if (has_image && alpha > 0.01f) {
+        Texture2D *t = assets_get_texture(&a->assets, c->image_ref);
+        if (t && t->id != 0) {
+            float avail_w = card.width - 80.f;
+            float avail_h = image_slot_h - 20.f;
+            float aspect = (float)t->width / (float)t->height;
+            float draw_w = avail_w;
+            float draw_h = draw_w / aspect;
+            if (draw_h > avail_h) {
+                draw_h = avail_h;
+                draw_w = draw_h * aspect;
+            }
+            float img_y = card.y + (jp ? (40.f + FONT_XL + 24.f + 40.f) : 40.f);
+            float img_x = card.x + (card.width - draw_w) / 2.f;
+
+            Rectangle shadow = { img_x + 4.f, img_y + 6.f, draw_w, draw_h };
+            ui_panel(shadow, (Color){ 0, 0, 0, (unsigned char)(90 * alpha) },
+                     RADIUS_SM);
+
+            DrawTexturePro(*t,
+                (Rectangle){ 0, 0, (float)t->width, (float)t->height },
+                (Rectangle){ img_x, img_y, draw_w, draw_h },
+                (Vector2){ 0, 0 }, 0.f,
+                anim_color_alpha(WHITE, alpha));
+
+            ui_outline((Rectangle){ img_x, img_y, draw_w, draw_h },
+                       0.04f, 6, 1.f,
+                       anim_color_alpha(TH.border_hi, alpha));
+        }
     }
 
-    if (s->revealed) {
-        draw_reveal_content(c, card, alpha);
-    }
+    draw_card_content(c, card, alpha);
 
-    /* Combo indicator — centered above the card, scales on each increment */
     if (S.combo >= 2 && S.phase != PHASE_RATED) {
         float cs = S.combo_scale.value;
         int combo_size = (int)(FONT_MD * cs);
@@ -601,9 +640,9 @@ void study_draw(App *a) {
     if (S.phase == PHASE_IDLE) {
         Rectangle rb = { (W - 220) / 2.f, card.y + card.height + 30.f, 220.f, 60.f };
         bool hov = ui_button_hover(rb);
-        float pulse = 0.5f + 0.5f * sinf((float)GetTime() * 2.4f);
+        float pulse2 = 0.5f + 0.5f * sinf((float)GetTime() * 2.4f);
         Color fill = hov ? TH.primary_hi
-                         : anim_color_lerp(TH.primary, TH.primary_hi, 0.15f * pulse);
+                         : anim_color_lerp(TH.primary, TH.primary_hi, 0.15f * pulse2);
         ui_panel_border(rb, fill, ui_lerp_color(fill, (Color){255,255,255,255}, 0.2f),
                         RADIUS_MD, 1.f);
         ui_text_center("REVEAL  [Space]", rb, FONT_MD, TH.text);
@@ -614,16 +653,15 @@ void study_draw(App *a) {
         Rectangle btns[4];
         rating_button_rects(W, H, btns);
         for (int i = 0; i < 4; i++) {
-            float s = S.btn_scale[i].value;
+            float sc = S.btn_scale[i].value;
             float glow = S.btn_glow[i];
             Rectangle r = btns[i];
-            float dw = r.width  * (1.f - s) * 0.5f;
-            float dh = r.height * (1.f - s) * 0.5f;
-            Rectangle dr = { r.x + dw, r.y + dh, r.width * s, r.height * s };
+            float dw = r.width  * (1.f - sc) * 0.5f;
+            float dh = r.height * (1.f - sc) * 0.5f;
+            Rectangle dr = { r.x + dw, r.y + dh, r.width * sc, r.height * sc };
 
             Color base = rating_color(i);
 
-            /* Hover glow behind */
             if (glow > 0.01f) {
                 Color gc = base;
                 gc.a = (unsigned char)(100 * glow);
@@ -646,6 +684,34 @@ void study_draw(App *a) {
                 (Rectangle){ dr.x, dr.y + 8, dr.width, 22 }, FONT_SM, TH.text);
             ui_text_center(ivbuf,
                 (Rectangle){ dr.x, dr.y + 34, dr.width, 22 }, FONT_XS, TH.text_muted);
+        }
+    }
+
+    /* -------- Audio replay button (revealed cards only) -------- */
+    if (s->revealed && c->audio_ref[0]) {
+        Rectangle ab = { card.x + card.width - 52.f, card.y + 12.f, 40.f, 40.f };
+        bool ah = ui_button_hover(ab);
+        Color ac = ah ? TH.primary : TH.panel_hi;
+        ui_panel_border(ab, ac, TH.border, RADIUS_MD, 1.f);
+
+        Vector2 ctr = { ab.x + 20.f, ab.y + 20.f };
+        DrawTriangle(
+            (Vector2){ ctr.x - 6, ctr.y - 4 },
+            (Vector2){ ctr.x - 6, ctr.y + 4 },
+            (Vector2){ ctr.x - 1, ctr.y + 8 }, TH.text);
+        DrawTriangle(
+            (Vector2){ ctr.x - 6, ctr.y - 4 },
+            (Vector2){ ctr.x - 1, ctr.y + 8 },
+            (Vector2){ ctr.x - 1, ctr.y - 8 }, TH.text);
+        DrawRectangle((int)(ctr.x - 1), (int)(ctr.y - 8), 4, 16, TH.text);
+        for (int i = 0; i < 2; i++) {
+            float r = 6.f + i * 4.f;
+            DrawRing(ctr, r, r + 1.5f, -50.f, 50.f, 20, TH.text_dim);
+        }
+
+        if (ah && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            assets_play_sound(&a->assets, c->audio_ref);
+            shake_add(&a->shake, 1.f);
         }
     }
 

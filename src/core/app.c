@@ -3,10 +3,17 @@
 #include "ui/ui.h"
 #include "screens/screens.h"
 #include <stdio.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <math.h>
+
+static void app_media_root(char *out, size_t cap) {
+    const char *home = getenv("HOME");
+    if (!home || !*home) home = ".";
+    snprintf(out, cap, "%s/.studyquest/media", home);
+}
 
 App *app_create(void) {
     App *a = (App *)RL_CALLOC(1, sizeof(App));
@@ -35,6 +42,10 @@ App *app_create(void) {
     free(cp);
     ui_set_fonts(&a->fonts);
 
+    char mroot[512];
+    app_media_root(mroot, sizeof(mroot));
+    assets_init(&a->assets, mroot);
+
     particles_reset(&a->particles);
     shake_reset(&a->shake);
 
@@ -48,6 +59,7 @@ App *app_create(void) {
 void app_destroy(App *a) {
     app_save(a);
     fonts_free(&a->fonts);
+    assets_free(&a->assets);
     RL_FREE(a);
 }
 

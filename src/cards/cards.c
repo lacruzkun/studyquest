@@ -1,6 +1,7 @@
 #include "cards.h"
 #include "study/scheduler.h"
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -40,6 +41,10 @@ void decklist_remove(DeckList *dl, int idx) {
     dl->count--;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Card creation                                                      */
+/* ------------------------------------------------------------------ */
+
 Card *deck_add_card(Deck *d, const char *front, const char *back, const char *tags) {
     if (d->card_count >= MAX_CARDS) return NULL;
     Card *c = &d->cards[d->card_count];
@@ -48,31 +53,30 @@ Card *deck_add_card(Deck *d, const char *front, const char *back, const char *ta
     safe_copy(c->front, MAX_TEXT, front);
     safe_copy(c->back,  MAX_TEXT, back);
     safe_copy(c->tags,  MAX_TAGS, tags ? tags : "");
-
     c->state = CARD_NEW;
     c->ease = 2.5f;
-    c->interval_sec = 0;
     c->due = (double)time(NULL) - 1.0;
-    c->last_review = 0;
-    c->reps = 0;
-    c->lapses = 0;
     c->last_rating = -1;
     d->card_count++;
     return c;
 }
 
-Card *deck_add_card_jp(Deck *d,
-                       const char *japanese, const char *reading,
-                       const char *meaning,  const char *example,
-                       const char *tags) {
-    /* front/back are set to the JP text and meaning so the deck stays
-       compatible with any code path that only knows front/back. */
-    Card *c = deck_add_card(d, japanese ? japanese : "", meaning ? meaning : "", tags);
+Card *deck_add_card_fields(Deck *d,
+                           const char (*names)[MAX_FIELD_NAME],
+                           const char (*values)[MAX_FIELD_VALUE],
+                           int n,
+                           const char *tags) {
+    if (n <= 0) return NULL;
+    if (n > MAX_FIELDS) n = MAX_FIELDS;
+
+    Card *c = deck_add_card(d, values[0], n > 1 ? values[1] : "", tags);
     if (!c) return NULL;
-    safe_copy(c->japanese, MAX_TEXT, japanese ? japanese : "");
-    safe_copy(c->reading,  MAX_TEXT, reading  ? reading  : "");
-    safe_copy(c->meaning,  MAX_TEXT, meaning  ? meaning  : "");
-    safe_copy(c->example,  MAX_TEXT, example  ? example  : "");
+
+    for (int i = 0; i < n; i++) {
+        safe_copy(c->field_names[i],  MAX_FIELD_NAME,  names[i]);
+        safe_copy(c->field_values[i], MAX_FIELD_VALUE, values[i]);
+    }
+    c->field_count = n;
     return c;
 }
 
@@ -103,12 +107,74 @@ float deck_retention(const Deck *d) {
     return (float)correct / (float)reviewed;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Field helpers                                                      */
+/* ------------------------------------------------------------------ */
+
+void card_add_field(Card *c, const char *name, const char *value) {
+    if (!c) return;
+    if (c->field_count >= MAX_FIELDS) return;
+    int i = c->field_count;
+    safe_copy(c->field_names[i],  MAX_FIELD_NAME,  name ? name : "");
+    safe_copy(c->field_values[i], MAX_FIELD_VALUE, value ? value : "");
+    c->field_count++;
+}
+
+const char *card_field_name(const Card *c, int i) {
+    if (!c || i < 0 || i >= c->field_count) return NULL;
+    return c->field_names[i];
+}
+
+const char *card_field_value(const Card *c, int i) {
+    if (!c || i < 0 || i >= c->field_count) return NULL;
+    return c->field_values[i];
+}
+
+const char *card_find_field(const Card *c, const char *name) {
+    if (!c || !name) return NULL;
+    for (int i = 0; i < c->field_count; i++)
+        if (strcasecmp(c->field_names[i], name) == 0)
+            return c->field_values[i];
+    return NULL;
+}
+
+bool card_has_cjk(const char *s) {
+    if (!s) return false;
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        int cp = 0, len = 1;
+        if      (p[0] < 0x80)              { cp = p[0]; len = 1; }
+        else if ((p[0] & 0xE0) == 0xC0) { cp = ((p[0]&0x1F)<<6)|(p[1]&0x3F); len = 2; }
+        else if ((p[0] & 0xF0) == 0xE0) { cp = ((p[0]&0x0F)<<12)|((p[1]&0x3F)<<6)|(p[2]&0x3F); len = 3; }
+        else if ((p[0] & 0xF8) == 0xF0) { cp = ((p[0]&0x07)<<18)|((p[1]&0x3F)<<12)|((p[2]&0x3F)<<6)|(p[3]&0x3F); len = 4; }
+        else { p++; continue; }
+
+        if ((cp >= 0x3040 && cp <= 0x30FF) ||
+            (cp >= 0x4E00 && cp <= 0x9FFF) ||
+            (cp >= 0x3400 && cp <= 0x4DBF))
+            return true;
+        p += len;
+    }
+    return false;
+}
+
 bool card_is_japanese(const Card *c) {
-    return c && c->japanese[0] != 0;
+    if (!c || c->field_count == 0) return false;
+    return card_has_cjk(c->field_values[0]);
+}
+
+void card_set_image(Card *c, const char *filename) {
+    if (!c) return;
+    safe_copy(c->image_ref, sizeof(c->image_ref), filename ? filename : "");
+}
+
+void card_set_audio(Card *c, const char *filename) {
+    if (!c) return;
+    safe_copy(c->audio_ref, sizeof(c->audio_ref), filename ? filename : "");
 }
 
 /* ==================================================================== */
-/*  Sample decks                                                        */
+/*  Sample decks                                                       */
 /* ==================================================================== */
 
 typedef struct { const char *q, *a, *tags; } SampleCard;
@@ -170,16 +236,13 @@ static const SampleCard SAMPLE_C[] = {
   "c,volatile"},
 };
 
-/* Japanese sample deck — the four the user asked for plus a few more. */
+/* Japanese sample deck — field-based. */
 typedef struct { const char *jp, *rd, *mean, *ex, *tags; } SampleJP;
 
 static const SampleJP SAMPLE_JP[] = {
- {"こんにちは", "こんにちは", "Hello",
-  "こんにちは、田中さん。", "greetings,common"},
- {"食べる", "たべる", "To eat",
-  "寿司を食べます。", "verbs,food"},
- {"学生", "がくせい", "Student",
-  "私は大学の学生です。", "nouns,school"},
+ {"こんにちは", "こんにちは", "Hello", "こんにちは、田中さん。", "greetings,common"},
+ {"食べる", "たべる", "To eat", "寿司を食べます。", "verbs,food"},
+ {"学生", "がくせい", "Student", "私は大学の学生です。", "nouns,school"},
  {"日本語を勉強しています。", "にほんごをべんきょうしています。",
   "I am studying Japanese.",
   "毎日、日本語を勉強しています。", "phrases,study"},
@@ -187,45 +250,43 @@ static const SampleJP SAMPLE_JP[] = {
   "おはようございます、先生。", "greetings,common"},
  {"ありがとう", "ありがとう", "Thank you (casual)",
   "手伝ってくれてありがとう。", "greetings,common"},
- {"水", "みず", "Water",
-  "水を一杯ください。", "nouns,food"},
- {"本", "ほん", "Book",
-  "この本は面白いです。", "nouns,objects"},
- {"大きい", "おおきい", "Big",
-  "大きい犬がいます。", "adjectives"},
- {"小さい", "ちいさい", "Small",
-  "小さい猫が好きです。", "adjectives"},
+ {"水", "みず", "Water", "水を一杯ください。", "nouns,food"},
+ {"本", "ほん", "Book", "この本は面白いです。", "nouns,objects"},
+ {"大きい", "おおきい", "Big", "大きい犬がいます。", "adjectives"},
+ {"小さい", "ちいさい", "Small", "小さい猫が好きです。", "adjectives"},
 };
 
 void decklist_init_sample(DeckList *dl) {
     decklist_init(dl);
 
-    /* ---- C Programming ---- */
-    Deck *c = decklist_add(dl, "C Programming",
-                           (Color){ 108, 132, 255, 255 });
+    Deck *c = decklist_add(dl, "C Programming", (Color){ 108, 132, 255, 255 });
     if (c) {
         int n = sizeof(SAMPLE_C) / sizeof(SAMPLE_C[0]);
         for (int i = 0; i < n; i++)
             deck_add_card(c, SAMPLE_C[i].q, SAMPLE_C[i].a, SAMPLE_C[i].tags);
     }
 
-    /* ---- Japanese (N5 Starter) ---- */
-    Deck *j = decklist_add(dl, "Japanese — N5 Starter",
-                           (Color){ 240, 120, 160, 255 });
+    Deck *j = decklist_add(dl, "Japanese — N5 Starter", (Color){ 240, 120, 160, 255 });
     if (j) {
         int n = sizeof(SAMPLE_JP) / sizeof(SAMPLE_JP[0]);
-        for (int i = 0; i < n; i++)
-            deck_add_card_jp(j,
-                             SAMPLE_JP[i].jp,
-                             SAMPLE_JP[i].rd,
-                             SAMPLE_JP[i].mean,
-                             SAMPLE_JP[i].ex,
-                             SAMPLE_JP[i].tags);
+        for (int i = 0; i < n; i++) {
+            char names[MAX_FIELDS][MAX_FIELD_NAME];
+            char values[MAX_FIELDS][MAX_FIELD_VALUE];
+            snprintf(names[0], MAX_FIELD_NAME,  "Word");
+            snprintf(values[0], MAX_FIELD_VALUE, "%s", SAMPLE_JP[i].jp);
+            snprintf(names[1], MAX_FIELD_NAME,  "Reading");
+            snprintf(values[1], MAX_FIELD_VALUE, "%s", SAMPLE_JP[i].rd);
+            snprintf(names[2], MAX_FIELD_NAME,  "Meaning");
+            snprintf(values[2], MAX_FIELD_VALUE, "%s", SAMPLE_JP[i].mean);
+            snprintf(names[3], MAX_FIELD_NAME,  "Example");
+            snprintf(values[3], MAX_FIELD_VALUE, "%s", SAMPLE_JP[i].ex);
+            deck_add_card_fields(j, names, values, 4, SAMPLE_JP[i].tags);
+        }
     }
 }
 
 /* ==================================================================== */
-/*  CSV import / export (unchanged CSV layout)                          */
+/*  CSV import / export                                                */
 /* ==================================================================== */
 
 static void write_csv_field(FILE *f, const char *s) {
@@ -244,16 +305,37 @@ static void write_csv_field(FILE *f, const char *s) {
 bool deck_export_csv(const Deck *d, const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f) return false;
-    fprintf(f, "front,back,tags,japanese,reading,meaning,example\n");
+
+    /* Write a header with the union of field names used by this deck.
+       Cards with different field counts still export fine — missing
+       columns come out empty. */
+    char names[MAX_FIELDS][MAX_FIELD_NAME];
+    int  name_count = 0;
     for (int i = 0; i < d->card_count; i++) {
         const Card *c = &d->cards[i];
-        write_csv_field(f, c->front); fputc(',', f);
-        write_csv_field(f, c->back);  fputc(',', f);
-        write_csv_field(f, c->tags);  fputc(',', f);
-        write_csv_field(f, c->japanese); fputc(',', f);
-        write_csv_field(f, c->reading);  fputc(',', f);
-        write_csv_field(f, c->meaning);  fputc(',', f);
-        write_csv_field(f, c->example);
+        for (int j = 0; j < c->field_count; j++) {
+            bool found = false;
+            for (int k = 0; k < name_count; k++)
+                if (strcasecmp(names[k], c->field_names[j]) == 0) { found = true; break; }
+            if (!found && name_count < MAX_FIELDS) {
+                safe_copy(names[name_count++], MAX_FIELD_NAME, c->field_names[j]);
+            }
+        }
+    }
+
+    fprintf(f, "tags");
+    for (int i = 0; i < name_count; i++) { fputc(',', f); write_csv_field(f, names[i]); }
+    fputc('\n', f);
+
+    for (int i = 0; i < d->card_count; i++) {
+        const Card *c = &d->cards[i];
+        write_csv_field(f, c->tags);
+        for (int k = 0; k < name_count; k++) {
+            fputc(',', f);
+            const char *v = card_find_field(c, names[k]);
+            if (!v) v = "";
+            write_csv_field(f, v);
+        }
         fputc('\n', f);
     }
     fclose(f);
@@ -290,25 +372,58 @@ int deck_import_csv(Deck *d, const char *path) {
     if (!f) return -1;
     char line[4096];
     int added = 0;
+
+    /* Read header to learn the field names. */
+    char header[MAX_FIELDS + 2][MAX_FIELD_NAME];
+    int header_count = 0;
     if (!fgets(line, sizeof(line), f)) { fclose(f); return 0; }
-    if (strncmp(line, "front,", 6) != 0) rewind(f);
+    {
+        int pos = 0;
+        while (header_count < MAX_FIELDS + 1) {
+            char tmp[MAX_FIELD_NAME];
+            int n = read_csv_field(line, &pos, tmp, sizeof(tmp));
+            if (n < 0) break;
+            snprintf(header[header_count], MAX_FIELD_NAME, "%s", tmp);
+            header_count++;
+            if (line[pos - 1] != ',') break;
+        }
+    }
+
+    /* If the header didn't look like "tags,Field,Field", treat it as data
+       and use front/back as default field names. */
+    bool has_tags = (header_count > 0 && strcasecmp(header[0], "tags") == 0);
+
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '\n' || line[0] == 0) continue;
         int pos = 0;
-        char q[MAX_TEXT]={0}, a[MAX_TEXT]={0}, t[MAX_TAGS]={0};
-        char jp[MAX_TEXT]={0}, rd[MAX_TEXT]={0}, mn[MAX_TEXT]={0}, ex[MAX_TEXT]={0};
-        read_csv_field(line, &pos, q,  sizeof(q));  if (line[pos]==',') pos++;
-        read_csv_field(line, &pos, a,  sizeof(a));  if (line[pos]==',') pos++;
-        read_csv_field(line, &pos, t,  sizeof(t));  if (line[pos]==',') pos++;
-        read_csv_field(line, &pos, jp, sizeof(jp)); if (line[pos]==',') pos++;
-        read_csv_field(line, &pos, rd, sizeof(rd)); if (line[pos]==',') pos++;
-        read_csv_field(line, &pos, mn, sizeof(mn)); if (line[pos]==',') pos++;
-        read_csv_field(line, &pos, ex, sizeof(ex));
-        if (jp[0]) {
-            deck_add_card_jp(d, jp, rd, mn[0] ? mn : a, ex, t);
-            added++;
-        } else if (q[0]) {
-            deck_add_card(d, q, a, t);
+
+        char tags[MAX_TAGS] = {0};
+        if (has_tags) {
+            read_csv_field(line, &pos, tags, sizeof(tags));
+            if (line[pos - 1] == ',') {} /* already advanced */
+        }
+
+        char names[MAX_FIELDS][MAX_FIELD_NAME];
+        char values[MAX_FIELDS][MAX_FIELD_VALUE];
+        int  n = 0;
+        while (n < MAX_FIELDS) {
+            char tmp[MAX_FIELD_VALUE];
+            int len = read_csv_field(line, &pos, tmp, sizeof(tmp));
+            if (len == 0 && line[pos] == 0) break;
+            if (has_tags) {
+                const char *src = header[n + 1 < header_count ? n + 1 : 0];
+                snprintf(names[n], MAX_FIELD_NAME, "%.47s", src);
+            } else {
+                snprintf(names[n], MAX_FIELD_NAME, "%s",
+                         (n == 0) ? "Front" : (n == 1) ? "Back" : "Field");
+            }
+            snprintf(values[n], MAX_FIELD_VALUE, "%s", tmp);
+            n++;
+            if (line[pos] == 0) break;
+        }
+
+        if (n > 0 && values[0][0]) {
+            deck_add_card_fields(d, names, values, n, tags);
             added++;
         }
     }

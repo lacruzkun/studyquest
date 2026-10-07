@@ -6,6 +6,7 @@
 #include "study/scheduler.h"
 #include "core/fonts.h"
 #include "core/anim.h"
+#include "core/assets.h"
 
 typedef enum {
     SCREEN_WELCOME,
@@ -55,6 +56,7 @@ typedef struct App {
     char save_path[512];
 
     FontSet        fonts;
+    AssetCache     assets;      /* NEW */
     ParticleSystem particles;
     Shake          shake;
     StudySession   session;

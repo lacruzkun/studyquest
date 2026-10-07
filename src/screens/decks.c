@@ -1,5 +1,6 @@
 #include "screens.h"
 #include "core/theme.h"
+#include "screens/import_ui.h"
 #include "ui/ui.h"
 #include <string.h>
 #include <stdio.h>
@@ -73,6 +74,9 @@ static void commit_card(App *a) {
 /* ------------------------------------------------------------------ */
 
 void decks_update(App *a, float dt) {
+    /* Import modal takes priority over everything on this screen. */
+    if (import_ui_update(a, dt)) return;
+
     (void)dt;
 
     /* -------- Modal editor: text input + shortcuts -------- */
@@ -301,16 +305,8 @@ void decks_draw(App *a) {
             D.edit_front[0] = D.edit_back[0] = D.edit_tags[0] = 0;
             D.edit_field = 0;
         }
-        if (ui_button(b_imp, "IMPORT", TH.panel_hi, TH.text)) {
-            char path[256];
-            snprintf(path, sizeof(path), "import_%d.csv", d->id);
-            int n = deck_import_csv(d, path);
-            if (n >= 0) {
-                app_toast(a, TextFormat("Imported %d cards.", n), TH.success);
-                app_save(a);
-            } else {
-                app_toast(a, TextFormat("Could not open %s", path), TH.warning);
-            }
+        if (ui_button(b_imp, "IMPORT ANKI", TH.primary, TH.text)) {
+            import_ui_start(a);
         }
         if (ui_button(b_exp, "EXPORT", TH.panel_hi, TH.text)) {
             char path[256];
@@ -430,4 +426,6 @@ void decks_draw(App *a) {
             D.confirm_delete_deck = -1;
         }
     }
+
+    import_ui_draw(a);
 }

@@ -36,14 +36,13 @@ static bool r_str(FILE *f, char *s, int max) {
 /* ---- deck / card / player serialization -------------------------- */
 
 static bool write_card(FILE *f, const Card *c) {
-    return w_i32(f, c->id)
+    if (!(w_i32(f, c->id)
         && w_str(f, c->front, MAX_TEXT)
         && w_str(f, c->back,  MAX_TEXT)
         && w_str(f, c->tags,  MAX_TAGS)
-        && w_str(f, c->japanese, MAX_TEXT)
-        && w_str(f, c->reading,  MAX_TEXT)
-        && w_str(f, c->meaning,  MAX_TEXT)
-        && w_str(f, c->example,  MAX_TEXT)
+        && w_str(f, c->image_ref, sizeof(c->image_ref))
+        && w_str(f, c->audio_ref, sizeof(c->audio_ref))
+        && w_i32(f, c->field_count)
         && w_i32(f, (int32_t)c->state)
         && w_f64(f, c->interval_sec)
         && w_f32(f, c->ease)
@@ -51,19 +50,24 @@ static bool write_card(FILE *f, const Card *c) {
         && w_i32(f, c->lapses)
         && w_f64(f, c->due)
         && w_f64(f, c->last_review)
-        && w_i32(f, c->last_rating);
+        && w_i32(f, c->last_rating))) return false;
+
+    for (int i = 0; i < c->field_count; i++) {
+        if (!w_str(f, c->field_names[i],  MAX_FIELD_NAME))  return false;
+        if (!w_str(f, c->field_values[i], MAX_FIELD_VALUE)) return false;
+    }
+    return true;
 }
 
 static bool read_card(FILE *f, Card *c) {
-    int32_t state, id, reps, lapses, lr;
-    return r_i32(f, &id)
+    int32_t state, id, reps, lapses, lr, fc;
+    if (!(r_i32(f, &id)
         && r_str(f, c->front, MAX_TEXT)
         && r_str(f, c->back,  MAX_TEXT)
         && r_str(f, c->tags,  MAX_TAGS)
-        && r_str(f, c->japanese, MAX_TEXT)
-        && r_str(f, c->reading,  MAX_TEXT)
-        && r_str(f, c->meaning,  MAX_TEXT)
-        && r_str(f, c->example,  MAX_TEXT)
+        && r_str(f, c->image_ref, sizeof(c->image_ref))
+        && r_str(f, c->audio_ref, sizeof(c->audio_ref))
+        && r_i32(f, &fc)
         && r_i32(f, &state)
         && r_f64(f, &c->interval_sec)
         && r_f32(f, &c->ease)
@@ -71,9 +75,21 @@ static bool read_card(FILE *f, Card *c) {
         && r_i32(f, &lapses)
         && r_f64(f, &c->due)
         && r_f64(f, &c->last_review)
-        && r_i32(f, &lr)
-        && (c->id = id, c->state = (CardState)state, c->reps = reps,
-            c->lapses = lapses, c->last_rating = lr, true);
+        && r_i32(f, &lr))) return false;
+
+    if (fc < 0 || fc > MAX_FIELDS) return false;
+    c->id = id;
+    c->state = (CardState)state;
+    c->reps = reps;
+    c->lapses = lapses;
+    c->last_rating = lr;
+    c->field_count = fc;
+
+    for (int i = 0; i < fc; i++) {
+        if (!r_str(f, c->field_names[i],  MAX_FIELD_NAME))  return false;
+        if (!r_str(f, c->field_values[i], MAX_FIELD_VALUE)) return false;
+    }
+    return true;
 }
 
 static bool write_deck(FILE *f, const Deck *d) {
@@ -88,7 +104,8 @@ static bool write_deck(FILE *f, const Deck *d) {
     return true;
 }
 
-static bool read_deck(FILE *f, Deck *d) {
+static bool read_deck(FILE *f, Deck *d, int save_version) {
+    (void)save_version;   /* V5 uses a fixed layout */
     memset(d, 0, sizeof(*d));
     int32_t id, cc; uint32_t col;
     if (!r_i32(f, &id)) return false;
@@ -102,7 +119,8 @@ static bool read_deck(FILE *f, Deck *d) {
     if (cc < 0 || cc > MAX_CARDS) return false;
     d->id = id;
     d->card_count = cc;
-    for (int i = 0; i < cc; i++) if (!read_card(f, &d->cards[i])) return false;
+    for (int i = 0; i < cc; i++)
+        if (!read_card(f, &d->cards[i])) return false;
     return true;
 }
 
@@ -211,7 +229,7 @@ bool save_load(SaveData *out, const char *path) {
     out->decks.next_id = next_id;
 
     for (int i = 0; i < count; i++) {
-        if (!read_deck(f, &out->decks.decks[i])) { fclose(f); return false; }
+        if (!read_deck(f, &out->decks.decks[i], (int)ver)) { fclose(f); return false; }
     }
 
     Player p;

@@ -22,6 +22,13 @@ void ui_text_wrapped(const char *t, Rectangle r, int size, Color c, int line_gap
 /* Rounded-rect outline that works across raylib versions. */
 void ui_outline(Rectangle r, float roundness, int segments, float thickness, Color c);
 
+/* Rich text: understands <b>, <u>, <br>, <br/>, and strips any other
+   HTML tag. UTF-8 is preserved byte-for-byte. Returns the y-coordinate
+   just below the last line drawn, so callers can stack content below.
+   ui_text_rich() is a thin wrapper that discards the return value. */
+float ui_text_rich_ex(const char *t, Rectangle r, int size, Color c, int line_gap);
+void  ui_text_rich(const char *t, Rectangle r, int size, Color c, int line_gap);
+
 bool ui_button(Rectangle r, const char *label, Color bg, Color text_col);
 bool ui_button_hover(Rectangle r);
 

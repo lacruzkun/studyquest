@@ -1,6 +1,8 @@
 #include "ui.h"
 #include "core/theme.h"
 #include <string.h>
+#include <strings.h>
+#include <ctype.h>
 #include <math.h>
 
 static const FontSet *g_fonts = NULL;
@@ -32,6 +34,8 @@ int ui_measure(const char *t, int size) {
     return (int)MeasureTextEx(pick(size), t, (float)size, 0.5f).x;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Panels and shapes                                                  */
 /* ------------------------------------------------------------------ */
 
 void ui_panel(Rectangle r, Color fill, float radius) {
@@ -76,6 +80,10 @@ void ui_progress(Rectangle r, float t, Color fill, Color bg, float radius) {
     ui_panel(f, fill, radius);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Text                                                               */
+/* ------------------------------------------------------------------ */
+
 void ui_text_ex(const char *t, Vector2 pos, int size, Color c, float spacing) {
     DrawTextEx(pick(size), t, pos, (float)size, spacing, c);
 }
@@ -102,19 +110,16 @@ void ui_text_wrapped(const char *t, Rectangle r, int size, Color c, int line_gap
         float line_w = 0.f;
         const char *q = p;
         while (*q && *q != '\n') {
-                        char buf[8] = {0};
+            char buf[4] = {0};
             int len = 1;
             unsigned char uc = (unsigned char)*q;
             if      ((uc & 0x80) == 0x00) len = 1;
             else if ((uc & 0xE0) == 0xC0) len = 2;
             else if ((uc & 0xF0) == 0xE0) len = 3;
             else if ((uc & 0xF8) == 0xF0) len = 4;
-            if (len > 4) len = 4;               /* guard against malformed input */
             for (int k = 0; k < len && q[k]; k++) buf[k] = q[k];
-            buf[len] = 0;                       /* explicit terminator */
             float w = MeasureTextEx(f, buf, (float)size, 0.5f).x;
             if (line_w + w > r.width && line_w > 0) break;
-            /* Prefer to break on ASCII space, but for CJK we can break anywhere. */
             if (*q == ' ') last_space = q;
             line_w += w;
             q += len;
@@ -136,6 +141,169 @@ void ui_text_wrapped(const char *t, Rectangle r, int size, Color c, int line_gap
         if (*p == '\n') p++;
     }
 }
+
+/* ------------------------------------------------------------------ */
+/*  Rich text                                                          */
+/*                                                                     */
+/*  Parses a small subset of inline markup into runs, then draws the   */
+/*  runs character-by-character (UTF-8 aware). Returns the y coordinate */
+/*  just below the last line, using the same font as the draw path so  */
+/*  callers can stack content consistently.                            */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    char text[256];
+    int  len;
+    bool bold;
+    bool underline;
+    bool forced_break;
+} RichRun;
+
+#define MAX_RICH_RUNS 96
+
+static int rich_parse(const char *in, RichRun *runs, int cap) {
+    int n = 0;
+    bool bold = false, under = false;
+    RichRun cur;
+    memset(&cur, 0, sizeof(cur));
+    const char *p = in;
+
+    #define FLUSH() do {                                  \
+        if (cur.len > 0) {                                \
+            if (n < cap) runs[n++] = cur;                 \
+            memset(&cur, 0, sizeof(cur));                 \
+        }                                                 \
+    } while (0)
+
+    #define FORCE_BREAK() do {                            \
+        FLUSH();                                          \
+        if (n < cap) {                                    \
+            RichRun b; memset(&b, 0, sizeof(b));          \
+            b.forced_break = true;                        \
+            runs[n++] = b;                                \
+        }                                                 \
+    } while (0)
+
+    while (*p && n < cap) {
+        if (p[0] == '<') {
+            const char *end = strchr(p, '>');
+            if (!end) { p++; continue; }
+            size_t tlen = (size_t)(end - (p + 1));
+            char tag[32];
+            if (tlen < sizeof(tag)) {
+                memcpy(tag, p + 1, tlen);
+                tag[tlen] = 0;
+                bool closing = (tag[0] == '/');
+                const char *name = closing ? tag + 1 : tag;
+
+                size_t nl = strlen(name);
+                if (nl > 0 && name[nl - 1] == '/') ((char*)name)[nl - 1] = 0;
+
+                if (strncasecmp(name, "b", 1) == 0 &&
+                    (name[1] == 0 || !isalnum((unsigned char)name[1]))) {
+                    FLUSH(); bold = !closing;
+                } else if (strncasecmp(name, "strong", 6) == 0) {
+                    FLUSH(); bold = !closing;
+                } else if (strncasecmp(name, "u", 1) == 0 &&
+                           (name[1] == 0 || !isalnum((unsigned char)name[1]))) {
+                    FLUSH(); under = !closing;
+                } else if (strncasecmp(name, "br", 2) == 0) {
+                    FORCE_BREAK();
+                }
+            }
+            p = end + 1;
+            continue;
+        }
+
+        if (p[0] == '\n') { FORCE_BREAK(); p++; continue; }
+
+        int len = 1;
+        unsigned char u = (unsigned char)*p;
+        if      ((u & 0xE0) == 0xC0) len = 2;
+        else if ((u & 0xF0) == 0xE0) len = 3;
+        else if ((u & 0xF8) == 0xF0) len = 4;
+
+        if (cur.len + len >= (int)sizeof(cur.text) - 1) {
+            if (n < cap) runs[n++] = cur;
+            memset(&cur, 0, sizeof(cur));
+        }
+        cur.bold = bold;
+        cur.underline = under;
+        for (int k = 0; k < len && p[k]; k++) cur.text[cur.len++] = p[k];
+        cur.text[cur.len] = 0;
+        p += len;
+    }
+    FLUSH();
+    #undef FLUSH
+    #undef FORCE_BREAK
+    return n;
+}
+
+float ui_text_rich_ex(const char *t, Rectangle r, int size, Color c, int line_gap) {
+    if (!t || !*t) return r.y;
+
+    RichRun runs[MAX_RICH_RUNS];
+    int n = rich_parse(t, runs, MAX_RICH_RUNS);
+    if (n == 0) return r.y;
+
+    Font f = pick(size);
+    float line_h = size + line_gap;
+    float x = r.x;
+    float y = r.y;
+
+    for (int i = 0; i < n; i++) {
+        RichRun *run = &runs[i];
+        if (run->forced_break) {
+            x = r.x;
+            y += line_h;
+            continue;
+        }
+
+        const char *p = run->text;
+        while (*p) {
+            if (y + line_h > r.y + r.height + line_h) {
+                /* Overflow — stop drawing but report the bottom. */
+                return y + line_h;
+            }
+
+            int len = 1;
+            unsigned char u = (unsigned char)*p;
+            if      ((u & 0xE0) == 0xC0) len = 2;
+            else if ((u & 0xF0) == 0xE0) len = 3;
+            else if ((u & 0xF8) == 0xF0) len = 4;
+
+            char ch[8] = {0};
+            for (int k = 0; k < len && p[k]; k++) ch[k] = p[k];
+
+            Vector2 m = MeasureTextEx(f, ch, (float)size, 0.5f);
+            if (x + m.x > r.x + r.width && x > r.x) {
+                x = r.x;
+                y += line_h;
+            }
+
+            DrawTextEx(f, ch, (Vector2){ x, y }, (float)size, 0.5f, c);
+            if (run->bold)
+                DrawTextEx(f, ch, (Vector2){ x + 0.7f, y }, (float)size, 0.5f, c);
+            if (run->underline)
+                DrawLineEx((Vector2){ x, y + size + 1.f },
+                           (Vector2){ x + m.x, y + size + 1.f },
+                           1.5f, c);
+
+            x += m.x;
+            p += len;
+        }
+    }
+
+    return y + line_h;
+}
+
+void ui_text_rich(const char *t, Rectangle r, int size, Color c, int line_gap) {
+    (void)ui_text_rich_ex(t, r, size, c, line_gap);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Buttons                                                            */
+/* ------------------------------------------------------------------ */
 
 bool ui_button_hover(Rectangle r) {
     return CheckCollisionPointRec(GetMousePosition(), r);

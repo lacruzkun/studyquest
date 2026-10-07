@@ -1,4 +1,0 @@
-/home/lacruz/Documents/dev/studyquest/build/CMakeFiles/studyquest.dir
-/home/lacruz/Documents/dev/studyquest/build/CMakeFiles/studyquest_tests.dir
-/home/lacruz/Documents/dev/studyquest/build/CMakeFiles/edit_cache.dir
-/home/lacruz/Documents/dev/studyquest/build/CMakeFiles/rebuild_cache.dir

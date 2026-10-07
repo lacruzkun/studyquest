@@ -38,8 +38,14 @@ static int *build_baseline_codepoints(int *out_count) {
     PUSH(0x2030); PUSH(0x2032); PUSH(0x2033);
     PUSH(0x20AC);
 
-    /* CJK Symbols and Punctuation — 。、「」etc. */
-    for (int c = 0x3000; c <= 0x303F; c++) PUSH(c);
+    /* CJK Symbols and Punctuation — 。、「」etc.
+       Skip 0x3031–0x3032 (vertical kana repeat marks) because their
+       glyphs exceed NotoSansJP's line-height metric and produce noisy
+       raylib warnings. They're not used in modern horizontal text. */
+    for (int c = 0x3000; c <= 0x303F; c++) {
+        if (c >= 0x3031 && c <= 0x3032) continue;
+        PUSH(c);
+    }
 
     /* Hiragana */
     for (int c = 0x3040; c <= 0x309F; c++) PUSH(c);
@@ -119,12 +125,15 @@ int *fonts_collect_from_decks(const DeckList *dl, int *out_count) {
         const Deck *d = &dl->decks[i];
         for (int j = 0; j < d->card_count && n < cap; j++) {
             const Card *c = &d->cards[j];
-            n = collect_cjk_from_string(c->front,    cps, n, cap);
-            n = collect_cjk_from_string(c->back,     cps, n, cap);
-            n = collect_cjk_from_string(c->japanese, cps, n, cap);
-            n = collect_cjk_from_string(c->reading,  cps, n, cap);
-            n = collect_cjk_from_string(c->meaning,  cps, n, cap);
-            n = collect_cjk_from_string(c->example,  cps, n, cap);
+
+            /* Legacy front/back (simple cards). */
+            n = collect_cjk_from_string(c->front, cps, n, cap);
+            n = collect_cjk_from_string(c->back,  cps, n, cap);
+
+            /* Field-based cards. */
+            for (int k = 0; k < c->field_count && n < cap; k++) {
+                n = collect_cjk_from_string(c->field_values[k], cps, n, cap);
+            }
         }
     }
 

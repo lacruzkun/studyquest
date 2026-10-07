@@ -12,9 +12,8 @@ pkgs.mkShell {
   nativeBuildInputs = with pkgs; [ cmake gnumake gcc pkg-config ];
 
   # NOTE: noto-fonts-cjk-sans provides .ttc files raylib can read.
-  buildInputs = (with pkgs; [ raylib noto-fonts-cjk-sans ]) ++ raylib_deps;
-
-  shellHook = ''
+    buildInputs = (with pkgs; [ raylib noto-fonts-cjk-sans zstd libwebp ]) ++ raylib_deps;
+    shellHook = ''
     export PKG_CONFIG_PATH="${pkgs.raylib}/lib/pkgconfig:$PKG_CONFIG_PATH"
     export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath (
       [ pkgs.raylib ] ++ raylib_deps
