@@ -48,7 +48,8 @@ typedef struct Card {
     struct {
         char ref[512];
         unsigned char kind; /* 0=image, 1=audio, 2=other */
-        unsigned char side; /* 0=front/template, 1=back/template */
+        unsigned char side; /* 0=front, 1=back */
+        unsigned char field_index; /* 0..MAX_FIELDS-1 for field media; 255=template/unknown */
     } media_refs[MAX_CARD_MEDIA_REFS];
 
     /* SRS state — unchanged. */
@@ -113,7 +114,7 @@ bool card_has_cjk(const char *s);
 /* Media. */
 void card_set_image(Card *c, const char *filename);
 void card_set_audio(Card *c, const char *filename);
-void card_add_media_ref(Card *c, const char *filename, int kind, int side);
+void card_add_media_ref(Card *c, const char *filename, int kind, int side, int field_index);
 
 bool deck_export_csv(const Deck *d, const char *path);
 int  deck_import_csv(Deck *d, const char *path);

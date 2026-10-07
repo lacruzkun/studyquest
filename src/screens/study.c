@@ -126,36 +126,46 @@ static const char *rating_label(int rating) {
     return "?";
 }
 
-static int card_media_count(const Card *c, int kind, bool revealed) {
+static int card_audio_count(const Card *c, bool revealed) {
     if (!c) return 0;
     int n = 0;
-    for (int i = 0; i < c->media_ref_count; i++) {
-        if (c->media_refs[i].kind != (unsigned char)kind) continue;
-        if (!revealed && c->media_refs[i].side != 0) continue;
-        n++;
+    if (revealed) {
+        for (int i = 0; i < c->media_ref_count; i++)
+            if (c->media_refs[i].kind == 1 && c->media_refs[i].side == 1) n++;
+        for (int i = 0; i < c->media_ref_count; i++)
+            if (c->media_refs[i].kind == 1 && c->media_refs[i].side == 0) n++;
+    } else {
+        for (int i = 0; i < c->media_ref_count; i++)
+            if (c->media_refs[i].kind == 1 && c->media_refs[i].side == 0) n++;
     }
-    if (n == 0 && kind == 0 && c->image_ref[0] && (revealed || c->media_ref_count == 0)) return 1;
-    if (n == 0 && kind == 1 && c->audio_ref[0] && (revealed || c->media_ref_count == 0)) return 1;
+    if (n == 0 && c->audio_ref[0]) return 1;
     return n;
 }
 
-static const char *card_media_at(const Card *c, int kind, bool revealed, int wanted_index) {
+static const char *card_audio_at(const Card *c, bool revealed, int wanted_index) {
     if (!c || wanted_index < 0) return NULL;
     int n = 0;
-    for (int i = 0; i < c->media_ref_count; i++) {
-        if (c->media_refs[i].kind != (unsigned char)kind) continue;
-        if (!revealed && c->media_refs[i].side != 0) continue;
-        if (n++ == wanted_index) return c->media_refs[i].ref;
+    if (revealed) {
+        /* Back-side audio is the primary set after reveal; front audio is
+           retained afterward for cards whose front also has sound. */
+        for (int side = 1; side >= 0; side--) {
+            for (int i = 0; i < c->media_ref_count; i++) {
+                if (c->media_refs[i].kind != 1 || c->media_refs[i].side != (unsigned char)side) continue;
+                if (n++ == wanted_index) return c->media_refs[i].ref;
+            }
+        }
+    } else {
+        for (int i = 0; i < c->media_ref_count; i++) {
+            if (c->media_refs[i].kind != 1 || c->media_refs[i].side != 0) continue;
+            if (n++ == wanted_index) return c->media_refs[i].ref;
+        }
     }
-    if (n == 0 && kind == 0 && c->image_ref[0] && (revealed || c->media_ref_count == 0) && wanted_index == 0)
-        return c->image_ref;
-    if (n == 0 && kind == 1 && c->audio_ref[0] && (revealed || c->media_ref_count == 0) && wanted_index == 0)
-        return c->audio_ref;
+    if (n == 0 && c->audio_ref[0] && wanted_index == 0) return c->audio_ref;
     return NULL;
 }
 
 static const char *card_first_audio(const Card *c, bool revealed) {
-    return card_media_at(c, 1, revealed, 0);
+    return card_audio_at(c, revealed, 0);
 }
 
 static void set_phase(App *a, StudyPhase p) {
@@ -430,7 +440,63 @@ void study_update(App *a, float dt) {
 /*  Draw helpers                                                       */
 /* ------------------------------------------------------------------ */
 
-static void draw_card_content(const Card *c, Rectangle card, float alpha) {
+static int card_image_count_for_side(const Card *c, int side) {
+    if (!c) return 0;
+    int n = 0;
+    for (int i = 0; i < c->media_ref_count; i++) {
+        if (c->media_refs[i].kind != 0) continue;
+        if (c->media_refs[i].side != (unsigned char)(side ? 1 : 0)) continue;
+        n++;
+    }
+    return n;
+}
+
+static float draw_card_media_images(App *a, const Card *c, Rectangle card,
+                                    int side, int field_index, float y, float alpha) {
+    if (!a || !c) return y;
+
+    unsigned char wanted_field = (unsigned char)(field_index < 0 ? 255 : field_index);
+    for (int i = 0; i < c->media_ref_count; i++) {
+        if (c->media_refs[i].kind != 0 ||
+            c->media_refs[i].side != (unsigned char)(side ? 1 : 0) ||
+            c->media_refs[i].field_index != wanted_field) continue;
+
+        Texture2D *t = assets_get_texture(&a->assets, c->media_refs[i].ref);
+        if (!t || t->id == 0) continue;
+
+        const float max_w = card.width - 100.f;
+        const float max_h = 150.f;
+        float aspect = (float)t->width / (float)t->height;
+        if (aspect <= 0.f) continue;
+
+        float draw_w = max_w;
+        float draw_h = draw_w / aspect;
+        if (draw_h > max_h) {
+            draw_h = max_h;
+            draw_w = draw_h * aspect;
+        }
+
+        float x = card.x + (card.width - draw_w) / 2.f;
+        float img_y = y + 2.f;
+
+        Rectangle shadow = { x + 4.f, img_y + 6.f, draw_w, draw_h };
+        ui_panel(shadow, (Color){ 0, 0, 0, (unsigned char)(90 * alpha) }, RADIUS_SM);
+        DrawTexturePro(*t,
+            (Rectangle){ 0, 0, (float)t->width, (float)t->height },
+            (Rectangle){ x, img_y, draw_w, draw_h },
+            (Vector2){ 0, 0 }, 0.f,
+            anim_color_alpha(WHITE, alpha));
+        ui_outline((Rectangle){ x, img_y, draw_w, draw_h },
+                   0.04f, 6, 1.f,
+                   anim_color_alpha(TH.border_hi, alpha));
+
+        y = img_y + draw_h + 12.f;
+    }
+
+    return y;
+}
+
+static void draw_card_content(App *a, const Card *c, Rectangle card, float alpha) {
     bool jp = card_is_japanese(c);
     float W = card.width;
 
@@ -449,9 +515,14 @@ static void draw_card_content(const Card *c, Rectangle card, float alpha) {
             (Rectangle){ card.x, wy, W, (float)FONT_XL + 10 },
             ws, anim_color_alpha(TH.text, alpha));
 
-        if (!revealed) return;
-
         float y = card.y + 40.f + FONT_XL + 24.f;
+        y = draw_card_media_images(a, c, card, 0, 0, y, alpha);
+
+        if (!revealed) {
+            y = draw_card_media_images(a, c, card, 0, 255, y, alpha);
+            return;
+        }
+
         bool divider_drawn = false;
 
         for (int i = 1; i < c->field_count; i++) {
@@ -467,6 +538,9 @@ static void draw_card_content(const Card *c, Rectangle card, float alpha) {
                 (Rectangle){ card.x + 20, ry, W - 40, 32 },
                 sz, anim_color_alpha(col, alpha * rev));
             y += 34.f;
+            if (rev >= 0.99f) {
+                y = draw_card_media_images(a, c, card, 1, i, y, alpha * rev);
+            }
 
             if (i == 1 && !divider_drawn && S.rev_divider > 0.f) {
                 float dw = (W - 200.f) * S.rev_divider;
@@ -478,12 +552,17 @@ static void draw_card_content(const Card *c, Rectangle card, float alpha) {
                 divider_drawn = true;
             }
         }
+        (void)draw_card_media_images(a, c, card, 1, 255, y, alpha);
     } else {
         float prompt_bottom = ui_text_rich_ex(prompt,
             (Rectangle){ card.x + 44, card.y + 40, W - 88, 200 },
             FONT_MD, anim_color_alpha(TH.text, alpha), 8);
 
-        if (!revealed) return;
+        prompt_bottom = draw_card_media_images(a, c, card, 0, 0, prompt_bottom + 8.f, alpha);
+        if (!revealed) {
+            (void)draw_card_media_images(a, c, card, 0, 255, prompt_bottom, alpha);
+            return;
+        }
 
         float div_y = prompt_bottom + 16.f;
         float min_div = card.y + 200.f;
@@ -518,7 +597,11 @@ static void draw_card_content(const Card *c, Rectangle card, float alpha) {
                 FONT_SM, anim_color_alpha(TH.text_dim, alpha * rev), 6);
 
             y = bottom + 12.f;
+            if (rev >= 0.99f) {
+                y = draw_card_media_images(a, c, card, 1, i, y, alpha * rev);
+            }
         }
+        (void)draw_card_media_images(a, c, card, 1, 255, y, alpha);
     }
 }
 
@@ -570,17 +653,18 @@ void study_draw(App *a) {
     /* -------- Card geometry -------- */
     Card *c = &d->cards[s->queue[s->current]];
     bool jp = card_is_japanese(c);
-    bool revealed = s->revealed || S.phase == PHASE_REVEAL || S.phase == PHASE_RATED;
-    const char *image_ref = card_media_at(c, 0, revealed, 0);
-    bool has_image = image_ref != NULL;
+    int front_image_count = card_image_count_for_side(c, 0);
+    int back_image_count = card_image_count_for_side(c, 1);
+    float front_image_h = front_image_count > 0
+        ? 20.f + front_image_count * 162.f : 0.f;
+    float back_image_h = back_image_count > 0
+        ? 20.f + back_image_count * 162.f : 0.f;
 
     float cw = jp ? 780.f : 740.f;
     if (cw > W - 80) cw = W - 80;
 
-    float image_slot_h = has_image ? 200.f : 0.f;
-
-    float base_front_h = (jp ? 300.f : 260.f) + image_slot_h;
-    float reveal_h = jp ? 260.f : 320.f;
+    float base_front_h = (jp ? 300.f : 260.f) + front_image_h;
+    float reveal_h = (jp ? 260.f : 320.f) + back_image_h;
     if (c->field_count > 3) reveal_h += (c->field_count - 3) * 26.f;
     float total_h = base_front_h + (s->revealed ? reveal_h : 0.f);
 
@@ -628,38 +712,9 @@ void study_draw(App *a) {
         border = anim_color_lerp(border, TH.primary_hi, S.rev_divider * 0.6f);
     ui_outline(card, 0.14f, 12, 2.f, anim_color_alpha(border, alpha));
 
-    if (has_image && alpha > 0.01f) {
-        Texture2D *t = assets_get_texture(&a->assets, image_ref);
-        if (t && t->id != 0) {
-            float avail_w = card.width - 80.f;
-            float avail_h = image_slot_h - 20.f;
-            float aspect = (float)t->width / (float)t->height;
-            float draw_w = avail_w;
-            float draw_h = draw_w / aspect;
-            if (draw_h > avail_h) {
-                draw_h = avail_h;
-                draw_w = draw_h * aspect;
-            }
-            float img_y = card.y + (jp ? (40.f + FONT_XL + 24.f + 40.f) : 40.f);
-            float img_x = card.x + (card.width - draw_w) / 2.f;
 
-            Rectangle shadow = { img_x + 4.f, img_y + 6.f, draw_w, draw_h };
-            ui_panel(shadow, (Color){ 0, 0, 0, (unsigned char)(90 * alpha) },
-                     RADIUS_SM);
 
-            DrawTexturePro(*t,
-                (Rectangle){ 0, 0, (float)t->width, (float)t->height },
-                (Rectangle){ img_x, img_y, draw_w, draw_h },
-                (Vector2){ 0, 0 }, 0.f,
-                anim_color_alpha(WHITE, alpha));
-
-            ui_outline((Rectangle){ img_x, img_y, draw_w, draw_h },
-                       0.04f, 6, 1.f,
-                       anim_color_alpha(TH.border_hi, alpha));
-        }
-    }
-
-    draw_card_content(c, card, alpha);
+    draw_card_content(a, c, card, alpha);
 
     if (S.combo >= 2 && S.phase != PHASE_RATED) {
         float cs = S.combo_scale.value;
@@ -727,8 +782,8 @@ void study_draw(App *a) {
     }
 
     /* -------- Audio replay button (revealed cards only) -------- */
-    const int audio_count = card_media_count(c, 1, true);
-    const char *selected_audio = card_media_at(c, 1, true, S.audio_ref_index);
+    const int audio_count = card_audio_count(c, true);
+    const char *selected_audio = card_audio_at(c, true, S.audio_ref_index);
     if (s->revealed && audio_count > 0 && selected_audio) {
         Rectangle ab = { card.x + card.width - 52.f, card.y + 12.f, 40.f, 40.f };
         bool ah = ui_button_hover(ab);

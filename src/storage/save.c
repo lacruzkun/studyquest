@@ -74,6 +74,7 @@ static bool write_card(FILE *f, const Card *c) {
         if (!w_str(f, c->media_refs[i].ref, sizeof(c->media_refs[i].ref))) return false;
         if (!w_i32(f, c->media_refs[i].kind)) return false;
         if (!w_i32(f, c->media_refs[i].side)) return false;
+        if (!w_i32(f, c->media_refs[i].field_index)) return false;
     }
     return true;
 }
@@ -138,20 +139,23 @@ static bool read_card(FILE *f, Card *c, int save_version) {
     c->media_ref_count = 0;
     if (save_version >= 6) {
         for (int i = 0; i < mc; i++) {
-            int32_t kind, side;
+            int32_t kind, side, field_index = 255;
             if (!r_str(f, c->media_refs[i].ref, sizeof(c->media_refs[i].ref)) ||
                 !r_i32(f, &kind) || !r_i32(f, &side) ||
-                kind < 0 || kind > 2 || side < 0 || side > 1) {
+                (save_version >= 7 && !r_i32(f, &field_index)) ||
+                kind < 0 || kind > 2 || side < 0 || side > 1 ||
+                field_index < 0 || field_index > 255) {
                 card_free(c);
                 return false;
             }
             c->media_refs[i].kind = (unsigned char)kind;
             c->media_refs[i].side = (unsigned char)side;
+            c->media_refs[i].field_index = (unsigned char)field_index;
             c->media_ref_count++;
         }
     } else {
-        if (c->image_ref[0]) card_add_media_ref(c, c->image_ref, 0, 0);
-        if (c->audio_ref[0]) card_add_media_ref(c, c->audio_ref, 1, 0);
+        if (c->image_ref[0]) card_add_media_ref(c, c->image_ref, 0, 0, 0);
+        if (c->audio_ref[0]) card_add_media_ref(c, c->audio_ref, 1, 0, 0);
     }
     return true;
 }

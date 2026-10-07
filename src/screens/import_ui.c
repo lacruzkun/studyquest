@@ -317,7 +317,8 @@ static bool run_chunk(App *a, int n) {
            performed after the package media pass below. */
         for (int m = 0; m < cc.media_ref_count; m++) {
             card_add_media_ref(card, cc.media_refs[m],
-                               cc.media_kinds[m], cc.media_sides[m]);
+                               cc.media_kinds[m], cc.media_sides[m],
+                               cc.media_fields[m]);
         }
 
         TraceLog(LOG_DEBUG,

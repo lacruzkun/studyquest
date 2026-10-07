@@ -96,16 +96,25 @@ static int test_conversion_and_persistence(const AnkiCollection *col,
     CHECK(cc.media_ref_count == 5);
 
     bool back_image = false, back_audio1 = false, back_audio2 = false;
+    int back_image_field = -1, back_audio1_field = -1, back_audio2_field = -1;
     for (int i = 0; i < cc.media_ref_count; i++) {
         if (cc.media_sides[i] != 1) continue;
-        if (cc.media_kinds[i] == 0 && strcmp(cc.media_refs[i], "back.webp") == 0)
+        if (cc.media_kinds[i] == 0 && strcmp(cc.media_refs[i], "back.webp") == 0) {
             back_image = true;
-        if (cc.media_kinds[i] == 1 && strcmp(cc.media_refs[i], "back.wav") == 0)
+            back_image_field = cc.media_fields[i];
+        }
+        if (cc.media_kinds[i] == 1 && strcmp(cc.media_refs[i], "back.wav") == 0) {
             back_audio1 = true;
-        if (cc.media_kinds[i] == 1 && strcmp(cc.media_refs[i], "back2.wav") == 0)
+            back_audio1_field = cc.media_fields[i];
+        }
+        if (cc.media_kinds[i] == 1 && strcmp(cc.media_refs[i], "back2.wav") == 0) {
             back_audio2 = true;
+            back_audio2_field = cc.media_fields[i];
+        }
     }
     CHECK(back_image && back_audio1 && back_audio2);
+    CHECK(back_image_field == 2);
+    CHECK(back_audio1_field == 2 && back_audio2_field == 2);
 
     static DeckList decks;
     decklist_init(&decks);
@@ -117,7 +126,7 @@ static int test_conversion_and_persistence(const AnkiCollection *col,
     for (int i = 0; i < cc.media_ref_count; i++) {
         char resolved[512];
         CHECK(media_import_resolve(mr, cc.media_refs[i], resolved, sizeof(resolved)));
-        card_add_media_ref(c, resolved, cc.media_kinds[i], cc.media_sides[i]);
+        card_add_media_ref(c, resolved, cc.media_kinds[i], cc.media_sides[i], cc.media_fields[i]);
     }
     CHECK(c->media_ref_count == 5);
     CHECK(c->image_ref[0] != 0);
@@ -160,8 +169,10 @@ static int test_conversion_and_persistence(const AnkiCollection *col,
     CHECK(loaded_c->media_ref_count == 5);
     CHECK(strcmp(loaded_c->media_refs[2].ref, "back.webp") == 0);
     CHECK(loaded_c->media_refs[2].side == 1);
+    CHECK(loaded_c->media_refs[2].field_index == 2);
     CHECK(strcmp(loaded_c->media_refs[3].ref, "back.wav") == 0);
     CHECK(loaded_c->media_refs[3].kind == 1 && loaded_c->media_refs[3].side == 1);
+    CHECK(loaded_c->media_refs[3].field_index == 2);
     CHECK(strlen(loaded->decks.decks[0].cards[1].field_values[0]) == strlen(very_long));
     CHECK(strstr(loaded->decks.decks[0].cards[1].field_values[0], kanji) != NULL);
 

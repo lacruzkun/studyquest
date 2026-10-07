@@ -10,6 +10,7 @@ typedef struct {
     char media_refs[ANKI_MAX_MEDIA_REFS][512];
     unsigned char media_kinds[ANKI_MAX_MEDIA_REFS];
     unsigned char media_sides[ANKI_MAX_MEDIA_REFS];
+    unsigned char media_fields[ANKI_MAX_MEDIA_REFS]; /* 0..MAX_FIELDS-1 for note fields; 255 for template media */
     int  media_ref_count;
 
     /* Every field of the note, cleaned and in order. Field 0 is the

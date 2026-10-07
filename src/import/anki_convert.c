@@ -27,11 +27,12 @@ static int media_kind_from_filename(const char *name) {
     return 2;
 }
 
-static void media_add(ConvertedCard *out, const char *ref, int kind, int side) {
+static void media_add(ConvertedCard *out, const char *ref, int kind, int side, int field_index) {
     if (!out || !ref || !*ref) return;
     for (int i = 0; i < out->media_ref_count; i++)
         if (out->media_kinds[i] == (unsigned char)kind &&
             out->media_sides[i] == (unsigned char)(side ? 1 : 0) &&
+            out->media_fields[i] == (unsigned char)(field_index < 0 ? 255 : field_index) &&
             strcmp(out->media_refs[i], ref) == 0)
             return;
 
@@ -55,9 +56,10 @@ static void media_add(ConvertedCard *out, const char *ref, int kind, int side) {
     memcpy(out->media_refs[i], ref, ref_len + 1);
     out->media_kinds[i] = (unsigned char)kind;
     out->media_sides[i] = (unsigned char)(side ? 1 : 0);
+    out->media_fields[i] = (unsigned char)(field_index < 0 ? 255 : field_index);
 }
 
-static void collect_media(ConvertedCard *out, const char *source, int side) {
+static void collect_media(ConvertedCard *out, const char *source, int side, int field_index) {
     if (!source || !*source) return;
     char dummy_text[1] = {0};
     char refs[ANKI_MAX_MEDIA_REFS][512] = {{0}};
@@ -65,7 +67,7 @@ static void collect_media(ConvertedCard *out, const char *source, int side) {
     anki_html_process(source, dummy_text, sizeof(dummy_text),
                       refs, &count, ANKI_MAX_MEDIA_REFS);
     for (int i = 0; i < count; i++)
-        media_add(out, refs[i], media_kind_from_filename(refs[i]), side);
+        media_add(out, refs[i], media_kind_from_filename(refs[i]), side, field_index);
 }
 
 bool anki_convert_card(const AnkiCollection *col,
@@ -95,14 +97,14 @@ bool anki_convert_card(const AnkiCollection *col,
         }
         anki_html_process(src, out->field_values[i], cap,
                           NULL, NULL, 0);
-        collect_media(out, src, i == 0 ? 0 : 1);
+        collect_media(out, src, i == 0 ? 0 : 1, i);
     }
     out->field_count = n;
 
     /* Static media can live directly in the selected card template. */
     if (card->ord >= 0 && card->ord < model->template_count) {
-        collect_media(out, model->templates[card->ord].qfmt, 0);
-        collect_media(out, model->templates[card->ord].afmt, 1);
+        collect_media(out, model->templates[card->ord].qfmt, 0, -1);
+        collect_media(out, model->templates[card->ord].afmt, 1, -1);
     }
 
     return true;

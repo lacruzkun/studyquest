@@ -203,12 +203,14 @@ bool card_is_japanese(const Card *c) {
     return card_has_cjk(c->field_values[0]);
 }
 
-void card_add_media_ref(Card *c, const char *filename, int kind, int side) {
+void card_add_media_ref(Card *c, const char *filename, int kind, int side, int field_index) {
     if (!c || !filename || !*filename) return;
 
+    unsigned char stored_field = (unsigned char)(field_index < 0 ? 255 : field_index);
     for (int i = 0; i < c->media_ref_count; i++) {
         if (c->media_refs[i].kind == (unsigned char)kind &&
             c->media_refs[i].side == (unsigned char)(side ? 1 : 0) &&
+            c->media_refs[i].field_index == stored_field &&
             strcmp(c->media_refs[i].ref, filename) == 0) {
             return;
         }
@@ -229,18 +231,19 @@ void card_add_media_ref(Card *c, const char *filename, int kind, int side) {
     safe_copy(c->media_refs[i].ref, sizeof(c->media_refs[i].ref), filename);
     c->media_refs[i].kind = (unsigned char)kind;
     c->media_refs[i].side = (unsigned char)(side ? 1 : 0);
+    c->media_refs[i].field_index = stored_field;
 }
 
 void card_set_image(Card *c, const char *filename) {
     if (!c) return;
     safe_copy(c->image_ref, sizeof(c->image_ref), filename ? filename : "");
-    if (filename && *filename) card_add_media_ref(c, filename, 0, 0);
+    if (filename && *filename) card_add_media_ref(c, filename, 0, 0, 0);
 }
 
 void card_set_audio(Card *c, const char *filename) {
     if (!c) return;
     safe_copy(c->audio_ref, sizeof(c->audio_ref), filename ? filename : "");
-    if (filename && *filename) card_add_media_ref(c, filename, 1, 0);
+    if (filename && *filename) card_add_media_ref(c, filename, 1, 0, 0);
 }
 
 int deck_due_count(const Deck *d, double now) {
