@@ -91,6 +91,7 @@ void app_save(App *a);
 void app_goto(App *a, Screen s);
 void app_toast(App *a, const char *msg, Color c);
 void app_start_session(App *a, int deck_id);
+void app_refresh_fonts(App *a);
 
 /* Spawn a reward flight. */
 void app_spawn_flight(App *a, Vector2 start, Vector2 end,

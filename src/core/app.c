@@ -33,14 +33,7 @@ App *app_create(void) {
     a->screen_t = 0;
     a->transition_style = TRANS_FADE;
 
-    /* Build the font from the baseline ranges + every CJK glyph that
-       actually appears in the user's cards. Auto-adapts: add a card
-       with a new kanji, next launch it renders. */
-    int cp_count = 0;
-    int *cp = fonts_collect_from_decks(&a->data.decks, &cp_count);
-    fonts_init(&a->fonts, cp, cp_count);
-    free(cp);
-    ui_set_fonts(&a->fonts);
+    app_refresh_fonts(a);
 
     char mroot[512];
     app_media_root(mroot, sizeof(mroot));
@@ -56,10 +49,21 @@ App *app_create(void) {
     return a;
 }
 
+void app_refresh_fonts(App *a) {
+    if (!a) return;
+    int cp_count = 0;
+    int *cp = fonts_collect_from_decks(&a->data.decks, &cp_count);
+    fonts_free(&a->fonts);
+    fonts_init(&a->fonts, cp, cp_count);
+    free(cp);
+    ui_set_fonts(&a->fonts);
+}
+
 void app_destroy(App *a) {
     app_save(a);
     fonts_free(&a->fonts);
     assets_free(&a->assets);
+    decklist_free(&a->data.decks);
     RL_FREE(a);
 }
 

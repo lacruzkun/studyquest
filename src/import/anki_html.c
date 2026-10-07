@@ -1,91 +1,207 @@
 #include "import/anki_html.h"
+#include "core/utf8.h"
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <stdlib.h>
+#include <stdint.h>
 
-/* Strip all HTML. Block-level closes and <br> become \n.
-   [sound:...] and <img src="..."> are extracted as media refs and
-   removed from the visible text. */
+static bool ref_exists(char refs[][512], int count, const char *value) {
+    for (int i = 0; i < count; i++)
+        if (strcmp(refs[i], value) == 0) return true;
+    return false;
+}
+
+static void add_ref(char refs[][512], int *count, int cap, const char *value) {
+    if (!value || !*value || !count || *count >= cap) return;
+    if (ref_exists(refs, *count, value)) return;
+    snprintf(refs[*count], 512, "%s", value);
+    (*count)++;
+}
+
+/* Decode the entities Anki content commonly contains. Numeric entities are
+   decoded to UTF-8 so Japanese content encoded as &#x4E00; remains Unicode. */
+static bool decode_entity(const char *p, char *out, size_t cap, size_t *consumed) {
+    if (!p || p[0] != '&' || !out || cap < 2) return false;
+
+    struct Named { const char *name; const char *utf8; };
+    static const struct Named named[] = {
+        { "amp;",   "&" }, { "lt;",    "<" }, { "gt;",    ">" },
+        { "quot;",  "\"" }, { "apos;", "'" }, { "#39;", "'" },
+        { "nbsp;",  " " }, { "mdash;", "\xE2\x80\x94" },
+        { "ndash;", "\xE2\x80\x93" }, { "hellip;", "\xE2\x80\xA6" }
+    };
+
+    for (size_t i = 0; i < sizeof(named)/sizeof(named[0]); i++) {
+        size_t n = strlen(named[i].name);
+        if (strncmp(p + 1, named[i].name, n) == 0) {
+            size_t len = strlen(named[i].utf8);
+            if (len >= cap) return false;
+            memcpy(out, named[i].utf8, len);
+            out[len] = 0;
+            if (consumed) *consumed = n + 1;
+            return true;
+        }
+    }
+
+    if (p[1] != '#') return false;
+    const char *q = p + 2;
+    int base = 10;
+    if (*q == 'x' || *q == 'X') { base = 16; q++; }
+    if (!isxdigit((unsigned char)*q)) return false;
+
+    uint32_t cp = 0;
+    const char *digits = q;
+    while (isxdigit((unsigned char)*q)) {
+        unsigned int digit;
+        if (*q >= '0' && *q <= '9') digit = (unsigned int)(*q - '0');
+        else if (*q >= 'a' && *q <= 'f') digit = (unsigned int)(*q - 'a' + 10);
+        else digit = (unsigned int)(*q - 'A' + 10);
+        if (digit >= (unsigned int)base) break;
+        if (cp > 0x10FFFFu / (unsigned)base) return false;
+        cp = cp * (unsigned)base + digit;
+        if (cp > 0x10FFFFu) return false;
+        q++;
+    }
+    if (q == digits || *q != ';' || (cp >= 0xD800u && cp <= 0xDFFFu)) return false;
+
+    char encoded[5];
+    size_t len = 0;
+    if (cp <= 0x7F) encoded[len++] = (char)cp;
+    else if (cp <= 0x7FF) {
+        encoded[len++] = (char)(0xC0 | (cp >> 6));
+        encoded[len++] = (char)(0x80 | (cp & 0x3F));
+    } else if (cp <= 0xFFFF) {
+        encoded[len++] = (char)(0xE0 | (cp >> 12));
+        encoded[len++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        encoded[len++] = (char)(0x80 | (cp & 0x3F));
+    } else {
+        encoded[len++] = (char)(0xF0 | (cp >> 18));
+        encoded[len++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        encoded[len++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        encoded[len++] = (char)(0x80 | (cp & 0x3F));
+    }
+    if (len >= cap) return false;
+    memcpy(out, encoded, len);
+    out[len] = 0;
+    if (consumed) *consumed = (size_t)(q - p + 1);
+    return true;
+}
+
+/* Extract src from the opening portion of an <img ...> tag. */
+static bool extract_img_src(const char *start, const char *close,
+                            char *out, size_t cap) {
+    const char *p = start + 4;
+    while (p < close) {
+        while (p < close && isspace((unsigned char)*p)) p++;
+        if (p >= close || *p == '>') break;
+
+        const char *name = p;
+        while (p < close && (isalnum((unsigned char)*p) || *p == '-' || *p == '_')) p++;
+        size_t nl = (size_t)(p - name);
+        if (nl == 0) { p++; continue; }
+
+        while (p < close && isspace((unsigned char)*p)) p++;
+        if (p >= close || *p != '=') {
+            while (p < close && !isspace((unsigned char)*p)) p++;
+            continue;
+        }
+        p++;
+        while (p < close && isspace((unsigned char)*p)) p++;
+
+        char quote = 0;
+        if (p < close && (*p == '\'' || *p == '"')) { quote = *p; p++; }
+        const char *value_start = p;
+        if (quote) {
+            while (p < close && *p != quote) p++;
+        } else {
+            while (p < close && !isspace((unsigned char)*p) && *p != '>') p++;
+        }
+        size_t raw_len = (size_t)(p - value_start);
+
+        if (nl == 3 && strncasecmp(name, "src", 3) == 0 && raw_len > 0) {
+            size_t w = 0;
+            const char *q = value_start;
+            const char *end = value_start + raw_len;
+            while (q < end && w + 1 < cap) {
+                if (*q == '&') {
+                    char entity[8] = {0};
+                    size_t consumed = 0;
+                    if (decode_entity(q, entity, sizeof(entity), &consumed) && q + consumed <= end) {
+                        size_t elen = strlen(entity);
+                        if (w + elen >= cap) break;
+                        memcpy(out + w, entity, elen);
+                        w += elen;
+                        q += consumed;
+                        continue;
+                    }
+                }
+                out[w++] = *q++;
+            }
+            out[w] = 0;
+            return w > 0;
+        }
+    }
+    return false;
+}
+
 void anki_html_process(const char *in, char *out, size_t cap,
-                       char media_refs[][256], int *media_count,
+                       char media_refs[][512], int *media_count,
                        int media_cap) {
+    if (!out || cap == 0) return;
+    out[0] = 0;
+    int local_media_count = 0;
+    if (!media_count) media_count = &local_media_count;
+    if (!in) return;
+
     size_t w = 0;
     const char *p = in;
 
     #define EMIT(ch) do { if (w + 1 < cap) out[w++] = (ch); } while (0)
-    #define EMIT_NL() do { \
-        if (w > 0 && out[w-1] != '\n') EMIT('\n'); \
+    #define EMIT_STR(str) do { \
+        const char *_q = (str); \
+        while (*_q && w + 1 < cap) out[w++] = *_q++; \
     } while (0)
+    #define EMIT_NL() do { if (w > 0 && out[w-1] != '\n') EMIT('\n'); } while (0)
 
-    while (*p && w + 1 < cap) {
-        /* [sound:audio.mp3] — extract filename, register, emit nothing. */
+    while (*p) {
         if (p[0] == '[' && strncasecmp(p, "[sound:", 7) == 0) {
             const char *close = strchr(p + 7, ']');
             if (close) {
-                char fname[256];
+                char fname[512];
                 size_t len = (size_t)(close - (p + 7));
                 if (len >= sizeof(fname)) len = sizeof(fname) - 1;
                 memcpy(fname, p + 7, len);
                 fname[len] = 0;
-                if (*media_count < media_cap) {
-                    bool dup = false;
-                    for (int i = 0; i < *media_count; i++)
-                        if (strcmp(media_refs[i], fname) == 0) { dup = true; break; }
-                    if (!dup) {
-                        snprintf(media_refs[*media_count], 256, "%s", fname);
-                        (*media_count)++;
-                    }
-                }
+                add_ref(media_refs, media_count, media_cap, fname);
                 p = close + 1;
                 continue;
             }
         }
 
-        /* <img src="..."> — extract src, register, emit nothing. */
         if (p[0] == '<' && strncasecmp(p, "<img", 4) == 0) {
             const char *close = strchr(p, '>');
             if (close) {
-                char src[256] = {0};
-                const char *sp = p;
-                while ((sp = strcasestr(sp, "src")) != NULL && sp < close) {
-                    const char *q = sp + 3;
-                    while (*q == ' ' || *q == '\t' || *q == '=') q++;
-                    char quote = 0;
-                    if (*q == '"' || *q == '\'') { quote = *q; q++; }
-                    const char *start = q;
-                    while (q < close && *q &&
-                           (quote ? *q != quote :
-                                    *q != ' ' && *q != '>' && *q != '/'))
-                        q++;
-                    size_t len = (size_t)(q - start);
-                    if (len > 0 && len < sizeof(src)) {
-                        memcpy(src, start, len);
-                        src[len] = 0;
-                    }
-                    break;
-                }
-                if (src[0] && *media_count < media_cap) {
-                    bool dup = false;
-                    for (int i = 0; i < *media_count; i++)
-                        if (strcmp(media_refs[i], src) == 0) { dup = true; break; }
-                    if (!dup) {
-                        snprintf(media_refs[*media_count], 256, "%s", src);
-                        (*media_count)++;
-                    }
-                }
+                char src[512] = {0};
+                if (extract_img_src(p, close, src, sizeof(src)))
+                    add_ref(media_refs, media_count, media_cap, src);
                 p = close + 1;
                 continue;
             }
         }
 
-        /* Any other tag: strip it. Block-closing tags become newlines. */
+        /* Do not leak comments, style/script payload, or other markup text. */
         if (p[0] == '<') {
+            if (strncmp(p, "<!--", 4) == 0) {
+                const char *end = strstr(p + 4, "-->");
+                if (end) { p = end + 3; continue; }
+            }
             const char *close = strchr(p, '>');
             if (close) {
                 const char *name = p + 1;
                 bool closing = false;
-                if (name[0] == '/') { closing = true; name++; }
-
+                if (*name == '/') { closing = true; name++; }
+                while (*name && isspace((unsigned char)*name)) name++;
                 char tname[16];
                 size_t nlen = 0;
                 while (name[nlen] && !isspace((unsigned char)name[nlen]) &&
@@ -97,66 +213,43 @@ void anki_html_process(const char *in, char *out, size_t cap,
                 tname[nlen] = 0;
 
                 bool is_break =
-                    (nlen == 2 && strcmp(tname, "br") == 0) ||
-                    (closing && nlen == 1 && strcmp(tname, "p") == 0) ||
-                    (closing && nlen == 3 && strcmp(tname, "div") == 0) ||
-                    (closing && nlen == 2 && strcmp(tname, "li") == 0) ||
-                    (closing && nlen == 2 && strcmp(tname, "tr") == 0) ||
-                    (closing && nlen == 2 && strcmp(tname, "h1") == 0) ||
-                    (closing && nlen == 2 && strcmp(tname, "h2") == 0) ||
-                    (closing && nlen == 2 && strcmp(tname, "h3") == 0) ||
-                    (closing && nlen == 2 && strcmp(tname, "h4") == 0) ||
-                    (closing && nlen == 2 && strcmp(tname, "h5") == 0) ||
-                    (closing && nlen == 2 && strcmp(tname, "h6") == 0);
-
+                    (strcmp(tname, "br") == 0) ||
+                    (closing && (strcmp(tname, "p") == 0 || strcmp(tname, "div") == 0 ||
+                                 strcmp(tname, "li") == 0 || strcmp(tname, "tr") == 0 ||
+                                 strcmp(tname, "h1") == 0 || strcmp(tname, "h2") == 0 ||
+                                 strcmp(tname, "h3") == 0 || strcmp(tname, "h4") == 0 ||
+                                 strcmp(tname, "h5") == 0 || strcmp(tname, "h6") == 0));
                 if (is_break) EMIT_NL();
                 p = close + 1;
                 continue;
             }
         }
 
-        /* HTML entities. */
         if (p[0] == '&') {
-            if (strncmp(p, "&amp;",   5) == 0) { EMIT('&');  p += 5; continue; }
-            if (strncmp(p, "&lt;",    4) == 0) { EMIT('<');  p += 4; continue; }
-            if (strncmp(p, "&gt;",    4) == 0) { EMIT('>');  p += 4; continue; }
-            if (strncmp(p, "&quot;",  6) == 0) { EMIT('"');  p += 6; continue; }
-            if (strncmp(p, "&apos;",  6) == 0) { EMIT('\''); p += 6; continue; }
-            if (strncmp(p, "&#39;",   5) == 0) { EMIT('\''); p += 5; continue; }
-            if (strncmp(p, "&nbsp;",  6) == 0) { EMIT(' ');  p += 6; continue; }
-            if (strncmp(p, "&mdash;", 7) == 0) {
-                const char *m = "\xE2\x80\x94";
-                for (const char *q = m; *q && w + 1 < cap; q++) out[w++] = *q;
-                p += 7; continue;
-            }
-            if (strncmp(p, "&ndash;", 7) == 0) {
-                const char *m = "\xE2\x80\x93";
-                for (const char *q = m; *q && w + 1 < cap; q++) out[w++] = *q;
-                p += 7; continue;
-            }
-            if (strncmp(p, "&hellip;", 8) == 0) {
-                const char *m = "\xE2\x80\xA6";
-                for (const char *q = m; *q && w + 1 < cap; q++) out[w++] = *q;
-                p += 8; continue;
+            char entity[8] = {0};
+            size_t consumed = 0;
+            if (decode_entity(p, entity, sizeof(entity), &consumed)) {
+                EMIT_STR(entity);
+                p += consumed;
+                continue;
             }
         }
 
-        /* Default: copy byte-for-byte (UTF-8 passes through unchanged). */
+        /* Preserve UTF-8 bytes exactly. Anki stores its textual fields as UTF-8. */
         EMIT(*p);
         p++;
     }
 
-    /* Trim trailing whitespace-only lines. */
-    while (w > 0 && (out[w-1] == '\n' || out[w-1] == ' ' || out[w-1] == '\t'))
-        w--;
+    while (w > 0 && (out[w-1] == '\n' || out[w-1] == ' ' || out[w-1] == '\t')) w--;
     out[w] = 0;
 
     #undef EMIT
+    #undef EMIT_STR
     #undef EMIT_NL
 }
 
 void anki_html_to_text(const char *in, char *out, size_t cap) {
-    char dummy_refs[1][256];
+    char dummy_refs[1][512];
     int dummy_count = 0;
     anki_html_process(in, out, cap, dummy_refs, &dummy_count, 0);
 }

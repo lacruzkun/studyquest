@@ -2,6 +2,7 @@
 #define MEDIA_IMPORTER_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 typedef enum {
     MEDIA_KIND_IMAGE = 0,
@@ -10,9 +11,10 @@ typedef enum {
 } MediaKind;
 
 typedef struct {
-    char      source_name[256];   /* name as it appears in cards */
+    char      source_name[512];   /* name as it appears in cards */
     char      archive_entry[64];  /* e.g. "0", "1" */
-    char      dest_path[600];     /* full path under media_dir */
+    char      dest_path[600];
+    char      dest_name[512];   /* normalized name used by StudyQuest */     /* full path under media_dir */
     MediaKind kind;
     bool      copied;
 } MediaEntry;
@@ -49,6 +51,11 @@ bool media_import_all(const char *apkg_path,
                       MediaImportResult *out);
 
 void media_import_free(MediaImportResult *r);
+
+/* Resolve an Anki media filename to the exact normalized filename written by
+   the importer. Returns false when that source filename was not in the map. */
+bool media_import_resolve(const MediaImportResult *r, const char *source_name,
+                          char *out_name, size_t out_cap);
 
 /* Categorize a filename by extension. Used internally, exposed for tests. */
 MediaKind media_kind_for(const char *filename);

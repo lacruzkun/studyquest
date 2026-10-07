@@ -242,17 +242,21 @@ else()
     target_link_libraries      (studyquest PRIVATE ${WEBP_LIBRARY})
     target_compile_definitions (studyquest PRIVATE SQ_HAVE_WEBP=1)
   else()
-    message(STATUS "libwebp: not found — WebP images will not load")
-    target_compile_definitions (studyquest PRIVATE SQ_HAVE_WEBP=0)
+    message(FATAL_ERROR
+      "libwebp is required for imported Anki WebP images.\n"
+      "  On NixOS: use the provided shell.nix (it includes libwebp).")
   endif()
 endif()
 
 # ====================================================================
-# Tests — pure logic, no raylib or importer linking.
+# Tests — logic and Anki import/media compatibility.
 # ====================================================================
 add_executable(studyquest_tests
   ${CMAKE_SOURCE_DIR}/tests/test_core.c
+  ${CMAKE_SOURCE_DIR}/tests/test_raylib_stubs.c
   ${CMAKE_SOURCE_DIR}/src/cards/cards.c
+  ${CMAKE_SOURCE_DIR}/src/storage/save.c
+  ${CMAKE_SOURCE_DIR}/src/core/utf8.c
   ${CMAKE_SOURCE_DIR}/src/study/scheduler.c
   ${CMAKE_SOURCE_DIR}/src/player/player.c
   ${CMAKE_SOURCE_DIR}/src/player/achievements.c
@@ -268,3 +272,54 @@ elseif(RAYLIB_INCLUDE_DIR)
 endif()
 
 target_link_libraries(studyquest_tests PRIVATE m Threads::Threads)
+
+# Focused integration/component coverage for APKG, SQLite, UTF-8, HTML/media,
+# media extraction, WebP decoding, card conversion and persistence.
+add_executable(studyquest_anki_import_tests
+  ${CMAKE_SOURCE_DIR}/tests/test_anki_import.c
+  ${CMAKE_SOURCE_DIR}/tests/test_raylib_stubs.c
+  ${CMAKE_SOURCE_DIR}/src/core/utf8.c
+  ${CMAKE_SOURCE_DIR}/src/import/anki_html.c
+  ${CMAKE_SOURCE_DIR}/src/import/anki_parser.c
+  ${CMAKE_SOURCE_DIR}/src/import/anki_json.c
+  ${CMAKE_SOURCE_DIR}/src/import/anki_convert.c
+  ${CMAKE_SOURCE_DIR}/src/import/apkg_importer.c
+  ${CMAKE_SOURCE_DIR}/src/import/media_importer.c
+  ${CMAKE_SOURCE_DIR}/src/cards/cards.c
+  ${CMAKE_SOURCE_DIR}/src/storage/save.c
+  ${CMAKE_SOURCE_DIR}/src/player/player.c
+  ${CMAKE_SOURCE_DIR}/src/player/achievements.c
+  ${CMAKE_SOURCE_DIR}/src/study/scheduler.c
+)
+target_include_directories(studyquest_anki_import_tests PRIVATE
+  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/third_party
+  ${CMAKE_SOURCE_DIR}/third_party/cjson
+  ${CMAKE_SOURCE_DIR}/third_party/miniz
+)
+if(RAYLIB_PC_FOUND)
+  target_include_directories(studyquest_anki_import_tests PRIVATE ${RAYLIB_PC_INCLUDE_DIRS})
+elseif(RAYLIB_INCLUDE_DIR)
+  target_include_directories(studyquest_anki_import_tests PRIVATE ${RAYLIB_INCLUDE_DIR})
+endif()
+if(WEBP_PC_FOUND)
+  target_include_directories(studyquest_anki_import_tests PRIVATE ${WEBP_PC_INCLUDE_DIRS})
+  target_link_directories(studyquest_anki_import_tests PRIVATE ${WEBP_PC_LIBRARY_DIRS})
+  target_link_libraries(studyquest_anki_import_tests PRIVATE ${WEBP_PC_LIBRARIES})
+elseif(WEBP_INCLUDE_DIR AND WEBP_LIBRARY)
+  target_include_directories(studyquest_anki_import_tests PRIVATE ${WEBP_INCLUDE_DIR})
+  target_link_libraries(studyquest_anki_import_tests PRIVATE ${WEBP_LIBRARY})
+else()
+  message(FATAL_ERROR "The Anki importer tests require libwebp.")
+endif()
+target_link_libraries(studyquest_anki_import_tests PRIVATE
+  ${SQ_MINIZ_TARGET}
+  ${SQ_SQLITE_TARGET}
+  ${SQ_ZSTD_TARGET}
+  ${SQ_CJSON_TARGET}
+  m Threads::Threads)
+
+enable_testing()
+add_test(NAME studyquest_core_tests COMMAND studyquest_tests)
+add_test(NAME studyquest_anki_import_tests
+  COMMAND studyquest_anki_import_tests ${CMAKE_SOURCE_DIR}/tests/fixtures/anki_media.apkg)

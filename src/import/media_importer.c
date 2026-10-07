@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <stdint.h>
 
 /* ================================================================== */
 /*  Small filesystem helpers                                           */
@@ -85,6 +86,40 @@ static bool sanitize_filename(const char *in, char *out, size_t cap) {
     if (out[0] == '.') return false;
 
     return true;
+}
+
+static uint32_t fnv1a32(const char *s) {
+    uint32_t h = 2166136261u;
+    if (!s) return h;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        h ^= *p;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void make_dest_name(const char *source, const char *safe_base,
+                           const MediaEntry *entries, int count,
+                           char *out, size_t cap) {
+    snprintf(out, cap, "%s", safe_base);
+    for (int i = 0; i < count; i++) {
+        if (!entries[i].copied || strcmp(entries[i].dest_name, out) != 0) continue;
+        if (strcmp(entries[i].source_name, source) == 0) return;
+
+        const char *dot = strrchr(safe_base, '.');
+        uint32_t h = fnv1a32(source);
+        if (dot && dot != safe_base) {
+            size_t stem = (size_t)(dot - safe_base);
+            if (stem > 400) stem = 400;
+            char base[512];
+            snprintf(base, sizeof(base), "%.*s__%08x%s",
+                     (int)stem, safe_base, h, dot);
+            snprintf(out, cap, "%s", base);
+        } else {
+            snprintf(out, cap, "%s__%08x", safe_base, h);
+        }
+        return;
+    }
 }
 
 /* ================================================================== */
@@ -291,8 +326,10 @@ bool media_import_all(const char *apkg_path,
 
         /* Resolve which subdir this file belongs in. */
         e->kind = media_kind_for(safe_name);
+        make_dest_name(e->source_name, safe_name, entries, i,
+                       e->dest_name, sizeof(e->dest_name));
         snprintf(e->dest_path, sizeof(e->dest_path),
-                 "%s/%s/%s", media_dir, kind_subdir(e->kind), safe_name);
+                 "%s/%s/%s", media_dir, kind_subdir(e->kind), e->dest_name);
 
         /* Extract. A missing archive entry is a warning, not an error. */
         size_t size = 0;
@@ -337,4 +374,18 @@ void media_import_free(MediaImportResult *r) {
     free(r->entries);
     r->entries = NULL;
     r->count = 0;
+}
+
+bool media_import_resolve(const MediaImportResult *r, const char *source_name,
+                          char *out_name, size_t out_cap) {
+    if (!r || !source_name || !*source_name || !out_name || out_cap == 0) return false;
+    for (int i = 0; i < r->count; i++) {
+        const MediaEntry *e = &r->entries[i];
+        if (strcmp(e->source_name, source_name) == 0) {
+            if (!e->copied || !e->dest_name[0]) return false;
+            snprintf(out_name, out_cap, "%s", e->dest_name);
+            return true;
+        }
+    }
+    return false;
 }

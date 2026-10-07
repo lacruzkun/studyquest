@@ -1,5 +1,6 @@
 #include "cards.h"
 #include "study/scheduler.h"
+#include "core/utf8.h"
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
@@ -7,6 +8,7 @@
 #include <time.h>
 
 static void safe_copy(char *dst, size_t cap, const char *src) {
+    if (!dst || cap == 0) return;
     if (!src) { dst[0] = 0; return; }
     size_t n = strlen(src);
     if (n >= cap) n = cap - 1;
@@ -14,9 +16,53 @@ static void safe_copy(char *dst, size_t cap, const char *src) {
     dst[n] = 0;
 }
 
+static char *dup_string(const char *src) {
+    if (!src) src = "";
+    size_t n = strlen(src);
+    char *p = (char *)malloc(n + 1);
+    if (!p) return NULL;
+    memcpy(p, src, n + 1);
+    return p;
+}
+
+void card_free(Card *c) {
+    if (!c) return;
+    for (int i = 0; i < MAX_FIELDS; i++) {
+        free(c->field_values[i]);
+        c->field_values[i] = NULL;
+    }
+    c->field_count = 0;
+}
+
+static void card_move(Card *dst, Card *src) {
+    if (!dst || !src || dst == src) return;
+    card_free(dst);
+    *dst = *src;
+    memset(src, 0, sizeof(*src));
+}
+
+static void deck_free(Deck *d) {
+    if (!d) return;
+    for (int i = 0; i < d->card_count; i++) card_free(&d->cards[i]);
+    d->card_count = 0;
+}
+
+static void deck_move(Deck *dst, Deck *src) {
+    if (!dst || !src || dst == src) return;
+    deck_free(dst);
+    *dst = *src;
+    memset(src, 0, sizeof(*src));
+}
+
 void decklist_init(DeckList *dl) {
     memset(dl, 0, sizeof(*dl));
     dl->next_id = 1;
+}
+
+void decklist_free(DeckList *dl) {
+    if (!dl) return;
+    for (int i = 0; i < dl->count; i++) deck_free(&dl->decks[i]);
+    memset(dl, 0, sizeof(*dl));
 }
 
 Deck *decklist_add(DeckList *dl, const char *name, Color color) {
@@ -37,12 +83,15 @@ Deck *decklist_find(DeckList *dl, int id) {
 
 void decklist_remove(DeckList *dl, int idx) {
     if (idx < 0 || idx >= dl->count) return;
-    for (int i = idx; i < dl->count - 1; i++) dl->decks[i] = dl->decks[i + 1];
+    deck_free(&dl->decks[idx]);
+    for (int i = idx; i < dl->count - 1; i++)
+        deck_move(&dl->decks[i], &dl->decks[i + 1]);
+    memset(&dl->decks[dl->count - 1], 0, sizeof(dl->decks[dl->count - 1]));
     dl->count--;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Card creation                                                      */
+/*  Card creation                                                     */
 /* ------------------------------------------------------------------ */
 
 Card *deck_add_card(Deck *d, const char *front, const char *back, const char *tags) {
@@ -62,19 +111,25 @@ Card *deck_add_card(Deck *d, const char *front, const char *back, const char *ta
 }
 
 Card *deck_add_card_fields(Deck *d,
-                           const char (*names)[MAX_FIELD_NAME],
-                           const char (*values)[MAX_FIELD_VALUE],
+                           char (*names)[MAX_FIELD_NAME],
+                           const char *const *values,
                            int n,
                            const char *tags) {
     if (n <= 0) return NULL;
     if (n > MAX_FIELDS) n = MAX_FIELDS;
+    if (!values) return NULL;
 
     Card *c = deck_add_card(d, values[0], n > 1 ? values[1] : "", tags);
     if (!c) return NULL;
 
     for (int i = 0; i < n; i++) {
-        safe_copy(c->field_names[i],  MAX_FIELD_NAME,  names[i]);
-        safe_copy(c->field_values[i], MAX_FIELD_VALUE, values[i]);
+        safe_copy(c->field_names[i], MAX_FIELD_NAME, names ? names[i] : "");
+        c->field_values[i] = dup_string(values[i] ? values[i] : "");
+        if (!c->field_values[i]) {
+            card_free(c);
+            d->card_count--;
+            return NULL;
+        }
     }
     c->field_count = n;
     return c;
@@ -82,41 +137,25 @@ Card *deck_add_card_fields(Deck *d,
 
 void deck_remove_card(Deck *d, int idx) {
     if (idx < 0 || idx >= d->card_count) return;
-    for (int i = idx; i < d->card_count - 1; i++) d->cards[i] = d->cards[i + 1];
+    card_free(&d->cards[idx]);
+    for (int i = idx; i < d->card_count - 1; i++)
+        card_move(&d->cards[i], &d->cards[i + 1]);
+    memset(&d->cards[d->card_count - 1], 0, sizeof(d->cards[d->card_count - 1]));
     d->card_count--;
     for (int i = 0; i < d->card_count; i++) d->cards[i].id = i + 1;
 }
 
-int deck_due_count(const Deck *d, double now) {
-    int n = 0;
-    for (int i = 0; i < d->card_count; i++)
-        if (scheduler_card_due(&d->cards[i], now)) n++;
-    return n;
-}
-
-float deck_retention(const Deck *d) {
-    int reviewed = 0, correct = 0;
-    for (int i = 0; i < d->card_count; i++) {
-        const Card *c = &d->cards[i];
-        if (c->reps > 0) {
-            reviewed += c->reps;
-            correct  += c->reps - c->lapses;
-        }
-    }
-    if (reviewed == 0) return 0.f;
-    return (float)correct / (float)reviewed;
-}
-
 /* ------------------------------------------------------------------ */
-/*  Field helpers                                                      */
+/*  Field helpers                                                     */
 /* ------------------------------------------------------------------ */
 
 void card_add_field(Card *c, const char *name, const char *value) {
-    if (!c) return;
-    if (c->field_count >= MAX_FIELDS) return;
+    if (!c || c->field_count >= MAX_FIELDS) return;
     int i = c->field_count;
-    safe_copy(c->field_names[i],  MAX_FIELD_NAME,  name ? name : "");
-    safe_copy(c->field_values[i], MAX_FIELD_VALUE, value ? value : "");
+    char *copy = dup_string(value ? value : "");
+    if (!copy) return;
+    safe_copy(c->field_names[i], MAX_FIELD_NAME, name ? name : "");
+    c->field_values[i] = copy;
     c->field_count++;
 }
 
@@ -140,20 +179,21 @@ const char *card_find_field(const Card *c, const char *name) {
 
 bool card_has_cjk(const char *s) {
     if (!s) return false;
-    const unsigned char *p = (const unsigned char *)s;
+    const char *p = s;
     while (*p) {
-        int cp = 0, len = 1;
-        if      (p[0] < 0x80)              { cp = p[0]; len = 1; }
-        else if ((p[0] & 0xE0) == 0xC0) { cp = ((p[0]&0x1F)<<6)|(p[1]&0x3F); len = 2; }
-        else if ((p[0] & 0xF0) == 0xE0) { cp = ((p[0]&0x0F)<<12)|((p[1]&0x3F)<<6)|(p[2]&0x3F); len = 3; }
-        else if ((p[0] & 0xF8) == 0xF0) { cp = ((p[0]&0x07)<<18)|((p[1]&0x3F)<<12)|((p[2]&0x3F)<<6)|(p[3]&0x3F); len = 4; }
-        else { p++; continue; }
-
+        uint32_t cp = 0;
+        size_t n = 0;
+        if (!sq_utf8_decode(p, &cp, &n)) {
+            p++;
+            continue;
+        }
         if ((cp >= 0x3040 && cp <= 0x30FF) ||
+            (cp >= 0x3400 && cp <= 0x4DBF) ||
             (cp >= 0x4E00 && cp <= 0x9FFF) ||
-            (cp >= 0x3400 && cp <= 0x4DBF))
+            (cp >= 0xF900 && cp <= 0xFAFF) ||
+            (cp >= 0x20000 && cp <= 0x2FA1F))
             return true;
-        p += len;
+        p += n;
     }
     return false;
 }
@@ -163,14 +203,64 @@ bool card_is_japanese(const Card *c) {
     return card_has_cjk(c->field_values[0]);
 }
 
+void card_add_media_ref(Card *c, const char *filename, int kind, int side) {
+    if (!c || !filename || !*filename) return;
+
+    for (int i = 0; i < c->media_ref_count; i++) {
+        if (c->media_refs[i].kind == (unsigned char)kind &&
+            c->media_refs[i].side == (unsigned char)(side ? 1 : 0) &&
+            strcmp(c->media_refs[i].ref, filename) == 0) {
+            return;
+        }
+    }
+
+    /* Keep the legacy aliases useful while retaining every discovered ref. */
+    if (kind == 0 && !c->image_ref[0]) safe_copy(c->image_ref, sizeof(c->image_ref), filename);
+    if (kind == 1 && !c->audio_ref[0]) safe_copy(c->audio_ref, sizeof(c->audio_ref), filename);
+
+    if (c->media_ref_count >= MAX_CARD_MEDIA_REFS) {
+        TraceLog(LOG_WARNING,
+                 "CARD: media reference limit reached; ignoring additional %s reference '%s'",
+                 kind == 0 ? "image" : kind == 1 ? "audio" : "other", filename);
+        return;
+    }
+
+    int i = c->media_ref_count++;
+    safe_copy(c->media_refs[i].ref, sizeof(c->media_refs[i].ref), filename);
+    c->media_refs[i].kind = (unsigned char)kind;
+    c->media_refs[i].side = (unsigned char)(side ? 1 : 0);
+}
+
 void card_set_image(Card *c, const char *filename) {
     if (!c) return;
     safe_copy(c->image_ref, sizeof(c->image_ref), filename ? filename : "");
+    if (filename && *filename) card_add_media_ref(c, filename, 0, 0);
 }
 
 void card_set_audio(Card *c, const char *filename) {
     if (!c) return;
     safe_copy(c->audio_ref, sizeof(c->audio_ref), filename ? filename : "");
+    if (filename && *filename) card_add_media_ref(c, filename, 1, 0);
+}
+
+int deck_due_count(const Deck *d, double now) {
+    int n = 0;
+    for (int i = 0; i < d->card_count; i++)
+        if (scheduler_card_due(&d->cards[i], now)) n++;
+    return n;
+}
+
+float deck_retention(const Deck *d) {
+    int reviewed = 0, correct = 0;
+    for (int i = 0; i < d->card_count; i++) {
+        const Card *c = &d->cards[i];
+        if (c->reps > 0) {
+            reviewed += c->reps;
+            correct  += c->reps - c->lapses;
+        }
+    }
+    if (reviewed == 0) return 0.f;
+    return (float)correct / (float)reviewed;
 }
 
 /* ==================================================================== */
@@ -280,7 +370,9 @@ void decklist_init_sample(DeckList *dl) {
             snprintf(values[2], MAX_FIELD_VALUE, "%s", SAMPLE_JP[i].mean);
             snprintf(names[3], MAX_FIELD_NAME,  "Example");
             snprintf(values[3], MAX_FIELD_VALUE, "%s", SAMPLE_JP[i].ex);
-            deck_add_card_fields(j, names, values, 4, SAMPLE_JP[i].tags);
+            const char *value_ptrs[MAX_FIELDS];
+            for (int k = 0; k < 4; k++) value_ptrs[k] = values[k];
+            deck_add_card_fields(j, names, value_ptrs, 4, SAMPLE_JP[i].tags);
         }
     }
 }
@@ -423,7 +515,9 @@ int deck_import_csv(Deck *d, const char *path) {
         }
 
         if (n > 0 && values[0][0]) {
-            deck_add_card_fields(d, names, values, n, tags);
+            const char *value_ptrs[MAX_FIELDS];
+            for (int k = 0; k < n; k++) value_ptrs[k] = values[k];
+            deck_add_card_fields(d, names, value_ptrs, n, tags);
             added++;
         }
     }

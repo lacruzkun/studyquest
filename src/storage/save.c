@@ -35,6 +35,18 @@ static bool r_str(FILE *f, char *s, int max) {
 
 /* ---- deck / card / player serialization -------------------------- */
 
+static bool r_alloc_str(FILE *f, char **out, size_t max_bytes) {
+    int32_t len;
+    if (!out || !r_i32(f, &len)) return false;
+    if (len < 0 || (uint32_t)len > max_bytes) return false;
+    char *s = (char *)malloc((size_t)len + 1);
+    if (!s) return false;
+    if (!r_bytes(f, s, (size_t)len)) { free(s); return false; }
+    s[len] = 0;
+    *out = s;
+    return true;
+}
+
 static bool write_card(FILE *f, const Card *c) {
     if (!(w_i32(f, c->id)
         && w_str(f, c->front, MAX_TEXT)
@@ -50,17 +62,24 @@ static bool write_card(FILE *f, const Card *c) {
         && w_i32(f, c->lapses)
         && w_f64(f, c->due)
         && w_f64(f, c->last_review)
-        && w_i32(f, c->last_rating))) return false;
+        && w_i32(f, c->last_rating)
+        && w_i32(f, c->media_ref_count))) return false;
 
     for (int i = 0; i < c->field_count; i++) {
-        if (!w_str(f, c->field_names[i],  MAX_FIELD_NAME))  return false;
-        if (!w_str(f, c->field_values[i], MAX_FIELD_VALUE)) return false;
+        if (!w_str(f, c->field_names[i], MAX_FIELD_NAME)) return false;
+        if (!w_str(f, c->field_values[i] ? c->field_values[i] : "", 0x7fffffff)) return false;
+    }
+
+    for (int i = 0; i < c->media_ref_count; i++) {
+        if (!w_str(f, c->media_refs[i].ref, sizeof(c->media_refs[i].ref))) return false;
+        if (!w_i32(f, c->media_refs[i].kind)) return false;
+        if (!w_i32(f, c->media_refs[i].side)) return false;
     }
     return true;
 }
 
-static bool read_card(FILE *f, Card *c) {
-    int32_t state, id, reps, lapses, lr, fc;
+static bool read_card(FILE *f, Card *c, int save_version) {
+    int32_t state, id, reps, lapses, lr, fc, mc = 0;
     if (!(r_i32(f, &id)
         && r_str(f, c->front, MAX_TEXT)
         && r_str(f, c->back,  MAX_TEXT)
@@ -78,16 +97,61 @@ static bool read_card(FILE *f, Card *c) {
         && r_i32(f, &lr))) return false;
 
     if (fc < 0 || fc > MAX_FIELDS) return false;
+    if (save_version >= 6 && !r_i32(f, &mc)) return false;
+    if (save_version >= 6 && (mc < 0 || mc > MAX_CARD_MEDIA_REFS)) return false;
+
     c->id = id;
     c->state = (CardState)state;
     c->reps = reps;
     c->lapses = lapses;
     c->last_rating = lr;
-    c->field_count = fc;
+    c->field_count = 0;
 
     for (int i = 0; i < fc; i++) {
-        if (!r_str(f, c->field_names[i],  MAX_FIELD_NAME))  return false;
-        if (!r_str(f, c->field_values[i], MAX_FIELD_VALUE)) return false;
+        if (!r_str(f, c->field_names[i], MAX_FIELD_NAME)) {
+            card_free(c);
+            return false;
+        }
+        if (save_version >= 6) {
+            if (!r_alloc_str(f, &c->field_values[i], 32 * 1024 * 1024u)) {
+                card_free(c);
+                return false;
+            }
+        } else {
+            /* V5 stored fields in the old fixed 384-byte buffer. Read the
+               serialized value into a bounded temporary and promote it to
+               the new heap-backed representation. */
+            char tmp[MAX_FIELD_VALUE];
+            if (!r_str(f, tmp, MAX_FIELD_VALUE)) {
+                card_free(c);
+                return false;
+            }
+            c->field_values[i] = strdup(tmp);
+            if (!c->field_values[i]) {
+                card_free(c);
+                return false;
+            }
+        }
+        c->field_count++;
+    }
+
+    c->media_ref_count = 0;
+    if (save_version >= 6) {
+        for (int i = 0; i < mc; i++) {
+            int32_t kind, side;
+            if (!r_str(f, c->media_refs[i].ref, sizeof(c->media_refs[i].ref)) ||
+                !r_i32(f, &kind) || !r_i32(f, &side) ||
+                kind < 0 || kind > 2 || side < 0 || side > 1) {
+                card_free(c);
+                return false;
+            }
+            c->media_refs[i].kind = (unsigned char)kind;
+            c->media_refs[i].side = (unsigned char)side;
+            c->media_ref_count++;
+        }
+    } else {
+        if (c->image_ref[0]) card_add_media_ref(c, c->image_ref, 0, 0);
+        if (c->audio_ref[0]) card_add_media_ref(c, c->audio_ref, 1, 0);
     }
     return true;
 }
@@ -105,7 +169,6 @@ static bool write_deck(FILE *f, const Deck *d) {
 }
 
 static bool read_deck(FILE *f, Deck *d, int save_version) {
-    (void)save_version;   /* V5 uses a fixed layout */
     memset(d, 0, sizeof(*d));
     int32_t id, cc; uint32_t col;
     if (!r_i32(f, &id)) return false;
@@ -120,7 +183,10 @@ static bool read_deck(FILE *f, Deck *d, int save_version) {
     d->id = id;
     d->card_count = cc;
     for (int i = 0; i < cc; i++)
-        if (!read_card(f, &d->cards[i])) return false;
+        if (!read_card(f, &d->cards[i], save_version)) {
+            for (int j = 0; j < i; j++) card_free(&d->cards[j]);
+            return false;
+        }
     return true;
 }
 
@@ -176,13 +242,19 @@ static bool read_player(FILE *f, Player *p) {
     }
     for (int i = 0; i < NUM_QUESTS; i++) {
         Quest *q = &p->quests[i];
-        if (!r_i32(f, &tmp32)) return false; q->type = (QuestType)tmp32;
+        if (!r_i32(f, &tmp32)) return false;
+        q->type = (QuestType)tmp32;
         if (!r_str(f, q->desc, 96)) return false;
-        if (!r_i32(f, &tmp32)) return false; q->target = tmp32;
-        if (!r_i32(f, &tmp32)) return false; q->progress = tmp32;
-        if (!r_i32(f, &tmp32)) return false; q->complete = tmp32 != 0;
-        if (!r_i32(f, &tmp32)) return false; q->xp_reward = tmp32;
-        if (!r_i32(f, &tmp32)) return false; q->coin_reward = tmp32;
+        if (!r_i32(f, &tmp32)) return false;
+        q->target = tmp32;
+        if (!r_i32(f, &tmp32)) return false;
+        q->progress = tmp32;
+        if (!r_i32(f, &tmp32)) return false;
+        q->complete = tmp32 != 0;
+        if (!r_i32(f, &tmp32)) return false;
+        q->xp_reward = tmp32;
+        if (!r_i32(f, &tmp32)) return false;
+        q->coin_reward = tmp32;
     }
         /* Backward-compatible read: older saves won't have this field. */
     {
@@ -217,7 +289,7 @@ bool save_load(SaveData *out, const char *path) {
 
     uint32_t magic, ver;
     if (!r_u32(f, &magic) || magic != SAVE_MAGIC) { fclose(f); return false; }
-    if (!r_u32(f, &ver) || ver != SAVE_VERSION)  { fclose(f); return false; }
+    if (!r_u32(f, &ver) || ver < 5 || ver > SAVE_VERSION)  { fclose(f); return false; }
 
     /* Deserialize straight into out->decks — no 2.5 MB intermediate copy. */
     int32_t count, next_id;

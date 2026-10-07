@@ -29,6 +29,7 @@ typedef struct StudyUI {
     StudyPhase phase;
     float      phase_t;
     int        queued_rating;
+    int        audio_ref_index;
 
     /* Card motion */
     float enter_x;
@@ -69,6 +70,7 @@ void study_reset_ui(void) {
     S.phase_t = 0.f;
     S.enter_x = 520.f;
     S.enter_alpha = 0.f;
+    S.audio_ref_index = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -124,12 +126,45 @@ static const char *rating_label(int rating) {
     return "?";
 }
 
+static int card_media_count(const Card *c, int kind, bool revealed) {
+    if (!c) return 0;
+    int n = 0;
+    for (int i = 0; i < c->media_ref_count; i++) {
+        if (c->media_refs[i].kind != (unsigned char)kind) continue;
+        if (!revealed && c->media_refs[i].side != 0) continue;
+        n++;
+    }
+    if (n == 0 && kind == 0 && c->image_ref[0] && (revealed || c->media_ref_count == 0)) return 1;
+    if (n == 0 && kind == 1 && c->audio_ref[0] && (revealed || c->media_ref_count == 0)) return 1;
+    return n;
+}
+
+static const char *card_media_at(const Card *c, int kind, bool revealed, int wanted_index) {
+    if (!c || wanted_index < 0) return NULL;
+    int n = 0;
+    for (int i = 0; i < c->media_ref_count; i++) {
+        if (c->media_refs[i].kind != (unsigned char)kind) continue;
+        if (!revealed && c->media_refs[i].side != 0) continue;
+        if (n++ == wanted_index) return c->media_refs[i].ref;
+    }
+    if (n == 0 && kind == 0 && c->image_ref[0] && (revealed || c->media_ref_count == 0) && wanted_index == 0)
+        return c->image_ref;
+    if (n == 0 && kind == 1 && c->audio_ref[0] && (revealed || c->media_ref_count == 0) && wanted_index == 0)
+        return c->audio_ref;
+    return NULL;
+}
+
+static const char *card_first_audio(const Card *c, bool revealed) {
+    return card_media_at(c, 1, revealed, 0);
+}
+
 static void set_phase(App *a, StudyPhase p) {
     (void)a;
     S.phase = p;
     S.phase_t = 0.f;
 
     if (p == PHASE_ENTER) {
+        S.audio_ref_index = 0;
         S.enter_x = 520.f;
         S.enter_alpha = 0.f;
         S.exit_x = 0.f;
@@ -137,6 +172,7 @@ static void set_phase(App *a, StudyPhase p) {
         S.exit_rot = 0.f;
         S.exit_alpha = 1.f;
     } else if (p == PHASE_REVEAL) {
+        S.audio_ref_index = 0;
         for (int i = 0; i < MAX_FIELDS; i++) S.rev_field[i] = 0.f;
         S.rev_divider = 0.f;
     } else if (p == PHASE_RATED) {
@@ -360,8 +396,9 @@ void study_update(App *a, float dt) {
                 10, TH.primary_hi, 120.f, 0.4f, P_SHAPE_SPARK, 6.f);
 
             Card *cur = &d->cards[s->queue[s->current]];
-            if (cur->audio_ref[0])
-                assets_play_sound(&a->assets, cur->audio_ref);
+            const char *audio = card_first_audio(cur, true);
+            if (audio)
+                assets_play_sound(&a->assets, audio);
         }
         return;
     }
@@ -533,7 +570,9 @@ void study_draw(App *a) {
     /* -------- Card geometry -------- */
     Card *c = &d->cards[s->queue[s->current]];
     bool jp = card_is_japanese(c);
-    bool has_image = (c->image_ref[0] != 0);
+    bool revealed = s->revealed || S.phase == PHASE_REVEAL || S.phase == PHASE_RATED;
+    const char *image_ref = card_media_at(c, 0, revealed, 0);
+    bool has_image = image_ref != NULL;
 
     float cw = jp ? 780.f : 740.f;
     if (cw > W - 80) cw = W - 80;
@@ -590,7 +629,7 @@ void study_draw(App *a) {
     ui_outline(card, 0.14f, 12, 2.f, anim_color_alpha(border, alpha));
 
     if (has_image && alpha > 0.01f) {
-        Texture2D *t = assets_get_texture(&a->assets, c->image_ref);
+        Texture2D *t = assets_get_texture(&a->assets, image_ref);
         if (t && t->id != 0) {
             float avail_w = card.width - 80.f;
             float avail_h = image_slot_h - 20.f;
@@ -688,7 +727,9 @@ void study_draw(App *a) {
     }
 
     /* -------- Audio replay button (revealed cards only) -------- */
-    if (s->revealed && c->audio_ref[0]) {
+    const int audio_count = card_media_count(c, 1, true);
+    const char *selected_audio = card_media_at(c, 1, true, S.audio_ref_index);
+    if (s->revealed && audio_count > 0 && selected_audio) {
         Rectangle ab = { card.x + card.width - 52.f, card.y + 12.f, 40.f, 40.f };
         bool ah = ui_button_hover(ab);
         Color ac = ah ? TH.primary : TH.panel_hi;
@@ -710,7 +751,8 @@ void study_draw(App *a) {
         }
 
         if (ah && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            assets_play_sound(&a->assets, c->audio_ref);
+            assets_play_sound(&a->assets, selected_audio);
+            if (audio_count > 1) S.audio_ref_index = (S.audio_ref_index + 1) % audio_count;
             shake_add(&a->shake, 1.f);
         }
     }

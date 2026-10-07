@@ -6,7 +6,7 @@
 #include <stddef.h>
 
 #define ANKI_MAX_FIELDS 32
-#define ANKI_MAX_FIELD_LEN 8192
+#define ANKI_MAX_MEDIA_REFS 32
 
 typedef struct {
     int64_t id;
@@ -30,7 +30,7 @@ typedef struct {
     char    guid[64];
     int64_t mid;                 /* model id */
     char    tags[512];           /* space-separated, with leading/trailing space */
-    char    fields[ANKI_MAX_FIELDS][ANKI_MAX_FIELD_LEN];
+    char   *fields[ANKI_MAX_FIELDS]; /* heap-owned UTF-8 field values */
     int     field_count;
     int     sort_field_index;
 } AnkiNote;

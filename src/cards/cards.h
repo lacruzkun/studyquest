@@ -15,9 +15,10 @@
    the prompt; fields 1..N-1 are revealed as the answer. Legacy CSV cards
    that only have front/back leave field_count = 0 and use the front/back
    strings directly. */
-#define MAX_FIELDS      8
-#define MAX_FIELD_NAME  48
-#define MAX_FIELD_VALUE 384
+#define MAX_FIELDS      32
+#define MAX_FIELD_NAME  64
+#define MAX_FIELD_VALUE 384 /* retained for legacy CSV/sample stack buffers */
+#define MAX_CARD_MEDIA_REFS 16
 
 typedef enum {
     CARD_NEW = 0,
@@ -37,11 +38,18 @@ typedef struct Card {
     /* Ordered field list (Anki and other rich imports). */
     int  field_count;
     char field_names[MAX_FIELDS][MAX_FIELD_NAME];
-    char field_values[MAX_FIELDS][MAX_FIELD_VALUE];
+    char *field_values[MAX_FIELDS];
 
-    /* Media references (filenames relative to ~/.studyquest/media). */
-    char image_ref[256];
-    char audio_ref[256];
+    /* Media references. image_ref/audio_ref remain as legacy aliases to the
+       first image/audio reference so existing UI/save code remains compatible. */
+    char image_ref[512];
+    char audio_ref[512];
+    int  media_ref_count;
+    struct {
+        char ref[512];
+        unsigned char kind; /* 0=image, 1=audio, 2=other */
+        unsigned char side; /* 0=front/template, 1=back/template */
+    } media_refs[MAX_CARD_MEDIA_REFS];
 
     /* SRS state — unchanged. */
     CardState state;
@@ -69,6 +77,7 @@ typedef struct DeckList {
 } DeckList;
 
 void decklist_init(DeckList *dl);
+void decklist_free(DeckList *dl);
 void decklist_init_sample(DeckList *dl);
 
 Deck *decklist_find(DeckList *dl, int id);
@@ -80,12 +89,13 @@ Card *deck_add_card(Deck *d, const char *front, const char *back, const char *ta
 
 /* Field-based card. `names` and `values` are parallel arrays of length n. */
 Card *deck_add_card_fields(Deck *d,
-                           const char (*names)[MAX_FIELD_NAME],
-                           const char (*values)[MAX_FIELD_VALUE],
+                           char (*names)[MAX_FIELD_NAME],
+                           const char *const *values,
                            int n,
                            const char *tags);
 
 void  deck_remove_card(Deck *d, int idx);
+void  card_free(Card *c);
 int   deck_due_count(const Deck *d, double now);
 float deck_retention(const Deck *d);
 
@@ -103,6 +113,7 @@ bool card_has_cjk(const char *s);
 /* Media. */
 void card_set_image(Card *c, const char *filename);
 void card_set_audio(Card *c, const char *filename);
+void card_add_media_ref(Card *c, const char *filename, int kind, int side);
 
 bool deck_export_csv(const Deck *d, const char *path);
 int  deck_import_csv(Deck *d, const char *path);

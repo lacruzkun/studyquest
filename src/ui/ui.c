@@ -1,9 +1,11 @@
 #include "ui.h"
 #include "core/theme.h"
+#include "core/utf8.h"
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
 #include <math.h>
+#include <stdlib.h>
 
 static const FontSet *g_fonts = NULL;
 
@@ -29,9 +31,40 @@ static Font pick(int nominal) {
     return fonts_pick(g_fonts, nominal);
 }
 
+static Font pick_cp(int nominal, uint32_t cp) {
+    if (!g_fonts) return GetFontDefault();
+    if (fonts_has_glyph(g_fonts, nominal, cp)) return fonts_pick(g_fonts, nominal);
+    if (fonts_has_fallback_glyph(g_fonts, nominal, cp)) return fonts_pick_fallback(g_fonts, nominal);
+    return fonts_pick(g_fonts, nominal);
+}
+
+static size_t next_utf8(const char *p, uint32_t *cp) {
+    size_t n = 0;
+    if (sq_utf8_decode(p, cp, &n)) return n;
+    if (cp) *cp = (unsigned char)*p;
+    return *p ? 1 : 0;
+}
+
+static float measure_utf8_with_fallback(const char *t, int size, float spacing) {
+    if (!t || !*t) return 0.f;
+    float w = 0.f;
+    const char *p = t;
+    while (*p) {
+        uint32_t cp = 0;
+        size_t len = next_utf8(p, &cp);
+        if (!len) break;
+        char ch[5] = {0};
+        size_t copy = len < sizeof(ch) - 1 ? len : sizeof(ch) - 1;
+        memcpy(ch, p, copy);
+        Font f = pick_cp(size, cp);
+        w += MeasureTextEx(f, ch, (float)size, spacing).x;
+        p += len;
+    }
+    return w;
+}
+
 int ui_measure(const char *t, int size) {
-    if (!t) return 0;
-    return (int)MeasureTextEx(pick(size), t, (float)size, 0.5f).x;
+    return (int)ceilf(measure_utf8_with_fallback(t, size, 0.5f));
 }
 
 /* ------------------------------------------------------------------ */
@@ -85,7 +118,29 @@ void ui_progress(Rectangle r, float t, Color fill, Color bg, float radius) {
 /* ------------------------------------------------------------------ */
 
 void ui_text_ex(const char *t, Vector2 pos, int size, Color c, float spacing) {
-    DrawTextEx(pick(size), t, pos, (float)size, spacing, c);
+    if (!t) return;
+    float x = pos.x;
+    const char *p = t;
+    while (*p) {
+        uint32_t cp = 0;
+        size_t len = next_utf8(p, &cp);
+        if (!len) break;
+        if (cp == '\n') {
+            x = pos.x;
+            pos.y += (float)size;
+            p += len;
+            continue;
+        }
+        char ch[5] = {0};
+        size_t copy = len < sizeof(ch) - 1 ? len : sizeof(ch) - 1;
+        memcpy(ch, p, copy);
+        Font f = pick_cp(size, cp);
+        Vector2 m = MeasureTextEx(f, ch, (float)size, spacing);
+        DrawTextEx(f, ch, pos, (float)size, spacing, c);
+        x += m.x;
+        pos.x = x;
+        p += len;
+    }
 }
 
 void ui_text(const char *t, int x, int y, int size, Color c) {
@@ -93,48 +148,53 @@ void ui_text(const char *t, int x, int y, int size, Color c) {
 }
 
 void ui_text_center(const char *t, Rectangle r, int size, Color c) {
-    Vector2 m = MeasureTextEx(pick(size), t, (float)size, 0.5f);
-    ui_text(t, (int)(r.x + (r.width - m.x) / 2),
-               (int)(r.y + (r.height - m.y) / 2), size, c);
+    float w = measure_utf8_with_fallback(t, size, 0.5f);
+    Font f = pick(size);
+    float h = MeasureTextEx(f, "Ag", (float)size, 0.5f).y;
+    ui_text(t, (int)(r.x + (r.width - w) / 2.f),
+               (int)(r.y + (r.height - h) / 2.f), size, c);
 }
 
 void ui_text_wrapped(const char *t, Rectangle r, int size, Color c, int line_gap) {
-    Font f = pick(size);
-    const char *p = t;
+    if (!t || !*t) return;
     float line_h = size + line_gap;
     float y = r.y;
+    const char *p = t;
 
     while (*p && y + line_h < r.y + r.height + line_h) {
         const char *line_start = p;
         const char *last_space = NULL;
         float line_w = 0.f;
         const char *q = p;
+
         while (*q && *q != '\n') {
-            char buf[4] = {0};
-            int len = 1;
-            unsigned char uc = (unsigned char)*q;
-            if      ((uc & 0x80) == 0x00) len = 1;
-            else if ((uc & 0xE0) == 0xC0) len = 2;
-            else if ((uc & 0xF0) == 0xE0) len = 3;
-            else if ((uc & 0xF8) == 0xF0) len = 4;
-            for (int k = 0; k < len && q[k]; k++) buf[k] = q[k];
-            float w = MeasureTextEx(f, buf, (float)size, 0.5f).x;
-            if (line_w + w > r.width && line_w > 0) break;
-            if (*q == ' ') last_space = q;
+            uint32_t cp = 0;
+            size_t len = next_utf8(q, &cp);
+            if (!len) break;
+            char ch[5] = {0};
+            size_t copy = len < sizeof(ch) - 1 ? len : sizeof(ch) - 1;
+            memcpy(ch, q, copy);
+            float w = MeasureTextEx(pick_cp(size, cp), ch, (float)size, 0.5f).x;
+            if (line_w + w > r.width && line_w > 0.f) break;
+            if (cp == ' ') last_space = q;
             line_w += w;
             q += len;
         }
-        const char *line_end = q;
-        if (*q && *q != '\n' && last_space && last_space > line_start) line_end = last_space;
 
-        int line_len = (int)(line_end - line_start);
+        const char *line_end = q;
+        if (*q && *q != '\n' && last_space && last_space > line_start)
+            line_end = last_space;
+
+        const size_t line_len = (size_t)(line_end - line_start);
         if (line_len > 0) {
-            char buf[1024];
-            int n = line_len < (int)sizeof(buf) - 1 ? line_len : (int)sizeof(buf) - 1;
-            memcpy(buf, line_start, n);
-            buf[n] = 0;
+            char *buf = (char *)malloc(line_len + 1);
+            if (!buf) return;
+            memcpy(buf, line_start, line_len);
+            buf[line_len] = 0;
             ui_text(buf, (int)r.x, (int)y, size, c);
+            free(buf);
         }
+
         y += line_h;
         p = line_end;
         while (*p == ' ') p++;
@@ -217,11 +277,10 @@ static int rich_parse(const char *in, RichRun *runs, int cap) {
 
         if (p[0] == '\n') { FORCE_BREAK(); p++; continue; }
 
-        int len = 1;
-        unsigned char u = (unsigned char)*p;
-        if      ((u & 0xE0) == 0xC0) len = 2;
-        else if ((u & 0xF0) == 0xE0) len = 3;
-        else if ((u & 0xF8) == 0xF0) len = 4;
+        uint32_t cp = 0;
+        size_t decoded_len = next_utf8(p, &cp);
+        if (!decoded_len) break;
+        int len = (int)decoded_len;
 
         if (cur.len + len >= (int)sizeof(cur.text) - 1) {
             if (n < cap) runs[n++] = cur;
@@ -246,7 +305,6 @@ float ui_text_rich_ex(const char *t, Rectangle r, int size, Color c, int line_ga
     int n = rich_parse(t, runs, MAX_RICH_RUNS);
     if (n == 0) return r.y;
 
-    Font f = pick(size);
     float line_h = size + line_gap;
     float x = r.x;
     float y = r.y;
@@ -266,15 +324,16 @@ float ui_text_rich_ex(const char *t, Rectangle r, int size, Color c, int line_ga
                 return y + line_h;
             }
 
-            int len = 1;
-            unsigned char u = (unsigned char)*p;
-            if      ((u & 0xE0) == 0xC0) len = 2;
-            else if ((u & 0xF0) == 0xE0) len = 3;
-            else if ((u & 0xF8) == 0xF0) len = 4;
+            uint32_t cp = 0;
+            size_t decoded_len = next_utf8(p, &cp);
+            if (!decoded_len) break;
+            int len = (int)decoded_len;
 
-            char ch[8] = {0};
-            for (int k = 0; k < len && p[k]; k++) ch[k] = p[k];
+            char ch[5] = {0};
+            size_t copy = decoded_len < sizeof(ch) - 1 ? decoded_len : sizeof(ch) - 1;
+            memcpy(ch, p, copy);
 
+            Font f = pick_cp(size, cp);
             Vector2 m = MeasureTextEx(f, ch, (float)size, 0.5f);
             if (x + m.x > r.x + r.width && x > r.x) {
                 x = r.x;

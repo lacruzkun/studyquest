@@ -1,6 +1,7 @@
 /* anki_parser.c */
 #include "import/anki_parser.h"
 #include "import/anki_json.h"
+#include "core/utf8.h"
 #include "sqlite3.h"
 
 #include <stdio.h>
@@ -82,17 +83,36 @@ static bool read_notes(sqlite3 *db, AnkiCollection *out) {
         if (guid) snprintf(n->guid, sizeof(n->guid), "%s", (const char *)guid);
         if (tags) snprintf(n->tags, sizeof(n->tags), "%s", (const char *)tags);
 
-        /* Anki stores fields as a single string joined by 0x1f (unit
-           separator). Split it here so downstream code sees plain fields. */
+        /* Anki stores fields as one UTF-8 string joined by 0x1f (unit
+           separator). Read the SQLite byte length instead of treating the
+           field as a fixed-size C buffer, then split without truncating the
+           database value. */
         if (flds) {
+            int total_bytes = sqlite3_column_bytes(st, 4);
             const char *p = (const char *)flds;
+            const char *end_all = p + total_bytes;
             int fi = 0;
-            while (*p && fi < ANKI_MAX_FIELDS) {
-                const char *sep = strchr(p, '\x1f');
-                size_t len = sep ? (size_t)(sep - p) : strlen(p);
-                if (len >= ANKI_MAX_FIELD_LEN) len = ANKI_MAX_FIELD_LEN - 1;
+            while (p <= end_all && fi < ANKI_MAX_FIELDS) {
+                const char *sep = memchr(p, '\x1f', (size_t)(end_all - p));
+                const char *end = sep ? sep : end_all;
+                size_t len = (size_t)(end - p);
+                n->fields[fi] = malloc(len + 1);
+                if (!n->fields[fi]) {
+                    for (int k = 0; k < fi; k++) free(n->fields[k]);
+                    sqlite3_finalize(st);
+                    snprintf(out->error, sizeof(out->error),
+                             "Out of memory while copying note fields.");
+                    return false;
+                }
                 memcpy(n->fields[fi], p, len);
                 n->fields[fi][len] = 0;
+
+                size_t bad = 0;
+                if (!sq_utf8_validate(n->fields[fi], &bad)) {
+                    fprintf(stderr,
+                            "StudyQuest ANKI: note %lld field %d contains invalid UTF-8 at byte %zu\n",
+                            (long long)n->id, fi, bad);
+                }
                 fi++;
                 if (!sep) break;
                 p = sep + 1;
@@ -214,6 +234,11 @@ void anki_collection_free(AnkiCollection *c) {
     if (!c) return;
     free(c->models);
     free(c->decks);
+    if (c->notes) {
+        for (int i = 0; i < c->note_count; i++)
+            for (int k = 0; k < c->notes[i].field_count; k++)
+                free(c->notes[i].fields[k]);
+    }
     free(c->notes);
     free(c->cards);
     free(c->models_json);

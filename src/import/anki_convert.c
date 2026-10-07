@@ -11,62 +11,61 @@ static const AnkiModel *find_model(const AnkiCollection *col, int64_t mid) {
     return NULL;
 }
 
-/* Substitute {{FieldName}} in a template. Also strips the common
-   {{#Field}}..{{/Field}} conditional markers, keeping the inner text
-   unconditionally. This is not a real template engine, but it gets
-   front/back templates right on every deck I've tested. */
-static void render_template(const char *tmpl, const AnkiNote *note,
-                            const AnkiModel *model,
-                            char *out, size_t cap) {
-    size_t w = 0;
-    const char *p = tmpl;
-    while (*p && w + 1 < cap) {
-        if (p[0] == '{' && p[1] == '{') {
-            const char *end = strstr(p + 2, "}}");
-            if (!end) break;
-            char inner[128];
-            size_t flen = (size_t)(end - (p + 2));
-            if (flen >= sizeof(inner)) flen = sizeof(inner) - 1;
-            memcpy(inner, p + 2, flen);
-            inner[flen] = 0;
+static int media_kind_from_filename(const char *name) {
+    const char *dot = name ? strrchr(name, '.') : NULL;
+    if (!dot) return 2;
+    static const char *images[] = {
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff", ".svg", ".ico", NULL
+    };
+    static const char *audio[] = {
+        ".mp3", ".ogg", ".oga", ".wav", ".flac", ".m4a", ".opus", ".aac", ".wma", ".aiff", ".aif", NULL
+    };
+    for (int i = 0; images[i]; i++)
+        if (strcasecmp(dot, images[i]) == 0) return 0;
+    for (int i = 0; audio[i]; i++)
+        if (strcasecmp(dot, audio[i]) == 0) return 1;
+    return 2;
+}
 
-            /* Trim. */
-            char *s = inner;
-            while (*s == ' ') s++;
-            char *e = s + strlen(s);
-            while (e > s && (e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
+static void media_add(ConvertedCard *out, const char *ref, int kind, int side) {
+    if (!out || !ref || !*ref) return;
+    for (int i = 0; i < out->media_ref_count; i++)
+        if (out->media_kinds[i] == (unsigned char)kind &&
+            out->media_sides[i] == (unsigned char)(side ? 1 : 0) &&
+            strcmp(out->media_refs[i], ref) == 0)
+            return;
 
-            /* Conditional markers: {{#Field}} {{/Field}} {{^Field}} —
-               just drop them, keeping surrounding text intact. */
-            bool conditional = (s[0] == '#' || s[0] == '/' || s[0] == '^');
-            if (conditional) { p = end + 2; continue; }
-
-            /* {{type:Field}} — treat as plain field. */
-            if (strncmp(s, "type:", 5) == 0) s += 5;
-
-            /* {{FrontSide}} — emit nothing; we don't have it handy here. */
-            if (strcasecmp(s, "FrontSide") == 0) {
-                p = end + 2;
-                continue;
-            }
-
-            int idx = -1;
-            for (int k = 0; k < model->field_count; k++)
-                if (strcasecmp(model->field_names[k], s) == 0) { idx = k; break; }
-
-            if (idx >= 0 && idx < note->field_count) {
-                const char *val = note->fields[idx];
-                size_t vlen = strlen(val);
-                if (w + vlen >= cap) vlen = cap - w - 1;
-                memcpy(out + w, val, vlen);
-                w += vlen;
-            }
-            p = end + 2;
-        } else {
-            out[w++] = *p++;
-        }
+    if (out->media_ref_count >= ANKI_MAX_MEDIA_REFS) {
+        fprintf(stderr,
+                "StudyQuest ANKI: media reference limit reached; additional ref '%s' ignored\n",
+                ref);
+        return;
     }
-    out[w] = 0;
+
+    size_t ref_len = strlen(ref);
+    if (ref_len >= sizeof(out->media_refs[0])) {
+        fprintf(stderr,
+                "StudyQuest ANKI: media reference too long (%zu bytes); "
+                "reference rejected: '%s'\n",
+                ref_len, ref);
+        return;
+    }
+
+    int i = out->media_ref_count++;
+    memcpy(out->media_refs[i], ref, ref_len + 1);
+    out->media_kinds[i] = (unsigned char)kind;
+    out->media_sides[i] = (unsigned char)(side ? 1 : 0);
+}
+
+static void collect_media(ConvertedCard *out, const char *source, int side) {
+    if (!source || !*source) return;
+    char dummy_text[1] = {0};
+    char refs[ANKI_MAX_MEDIA_REFS][512] = {{0}};
+    int count = 0;
+    anki_html_process(source, dummy_text, sizeof(dummy_text),
+                      refs, &count, ANKI_MAX_MEDIA_REFS);
+    for (int i = 0; i < count; i++)
+        media_add(out, refs[i], media_kind_from_filename(refs[i]), side);
 }
 
 bool anki_convert_card(const AnkiCollection *col,
@@ -80,22 +79,40 @@ bool anki_convert_card(const AnkiCollection *col,
     const AnkiModel *model = find_model(col, note->mid);
     if (!model) return false;
 
-    /* We don't use the card template to decide what goes on the front —
-       we just take the note's fields in order. Field 0 is the prompt;
-       fields 1..N-1 are shown after reveal. This matches every Japanese
-       deck I've tested (Kaishi, Core, JLPT) and works fine for math,
-       chess, or anything else with a labelled field list. */
     int n = model->field_count;
     if (n > note->field_count) n = note->field_count;
     if (n > MAX_FIELDS) n = MAX_FIELDS;
 
     for (int i = 0; i < n; i++) {
         snprintf(out->field_names[i], MAX_FIELD_NAME, "%s", model->field_names[i]);
-        anki_html_process(note->fields[i],
-                          out->field_values[i], MAX_FIELD_VALUE,
-                          out->media_refs, &out->media_ref_count, 8);
+
+        const char *src = note->fields[i] ? note->fields[i] : "";
+        size_t cap = strlen(src) + 1;
+        out->field_values[i] = (char *)malloc(cap ? cap : 1);
+        if (!out->field_values[i]) {
+            anki_converted_card_free(out);
+            return false;
+        }
+        anki_html_process(src, out->field_values[i], cap,
+                          NULL, NULL, 0);
+        collect_media(out, src, i == 0 ? 0 : 1);
     }
     out->field_count = n;
 
+    /* Static media can live directly in the selected card template. */
+    if (card->ord >= 0 && card->ord < model->template_count) {
+        collect_media(out, model->templates[card->ord].qfmt, 0);
+        collect_media(out, model->templates[card->ord].afmt, 1);
+    }
+
     return true;
+}
+
+void anki_converted_card_free(ConvertedCard *card) {
+    if (!card) return;
+    for (int i = 0; i < MAX_FIELDS; i++) {
+        free(card->field_values[i]);
+        card->field_values[i] = NULL;
+    }
+    card->field_count = 0;
 }

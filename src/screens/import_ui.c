@@ -14,6 +14,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <inttypes.h>
 
 /* ================================================================== */
 /*  State                                                              */
@@ -285,16 +286,23 @@ static bool run_chunk(App *a, int n) {
     for (int i = I.run_card_index; i < end; i++) {
         const AnkiCard *ac = &I.col.cards[i];
         ConvertedCard cc;
-        if (!anki_convert_card(&I.col, ac, &cc)) continue;
+        if (!anki_convert_card(&I.col, ac, &cc)) {
+            TraceLog(LOG_WARNING, "ANKI: failed to convert card %d (nid=%" PRId64 ")", i, ac->nid);
+            continue;
+        }
 
         Card *card;
         if (cc.field_count > 0) {
-            card = deck_add_card_fields(d, cc.field_names, cc.field_values,
+            card = deck_add_card_fields(d, cc.field_names,
+                                        (const char *const *)cc.field_values,
                                         cc.field_count, "");
         } else {
             card = deck_add_card(d, "", "", "");
         }
-        if (!card) continue;
+        if (!card) {
+            anki_converted_card_free(&cc);
+            continue;
+        }
 
         /* Tags live on the note, not the card. */
         const AnkiNote *note = anki_find_note(&I.col, ac->nid);
@@ -304,14 +312,18 @@ static bool run_chunk(App *a, int n) {
             if (csv[0]) snprintf(card->tags, MAX_TAGS, "%s", csv);
         }
 
-        /* Media: attach first image and first audio. */
+        /* Preserve every discovered media reference and which side it
+           belongs to. Resolution to the normalized imported filename is
+           performed after the package media pass below. */
         for (int m = 0; m < cc.media_ref_count; m++) {
-            MediaKind kind = media_kind_for(cc.media_refs[m]);
-            if (kind == MEDIA_KIND_IMAGE && !card->image_ref[0])
-                card_set_image(card, cc.media_refs[m]);
-            else if (kind == MEDIA_KIND_AUDIO && !card->audio_ref[0])
-                card_set_audio(card, cc.media_refs[m]);
+            card_add_media_ref(card, cc.media_refs[m],
+                               cc.media_kinds[m], cc.media_sides[m]);
         }
+
+        TraceLog(LOG_DEBUG,
+                 "ANKI: card %d nid=%" PRId64 " fields=%d media=%d",
+                 i, ac->nid, cc.field_count, cc.media_ref_count);
+        anki_converted_card_free(&cc);
     }
 
     I.run_card_index = end;
@@ -426,12 +438,20 @@ bool import_ui_update(App *a, float dt) {
         }
 
         if (I.run_card_index >= I.col.card_count) {
+            Deck *imported_deck = decklist_find(&a->data.decks, I.run_deck_id);
+            if (!imported_deck) {
+                snprintf(I.error, sizeof(I.error), "Imported deck disappeared before media resolution.");
+                I.phase = IMP_ERROR;
+                I.phase_t = 0.f;
+                return true;
+            }
+
             /* Media pass. Synchronous but bounded by file count. */
             if (I.handle.media_json_path[0]) {
                 char mroot[512];
                 media_root(mroot, sizeof(mroot));
 
-                MediaImportResult mr;
+                MediaImportResult mr = {0};
                 char real_path[512];
                 expand_tilde(I.path_input, sizeof(I.path_input), real_path, sizeof(real_path));
                 if (!media_import_all(real_path,
@@ -440,13 +460,41 @@ bool import_ui_update(App *a, float dt) {
                     TraceLog(LOG_WARNING, "Media import failed: %s", mr.error);
                 } else {
                     TraceLog(LOG_INFO,
-                        "Media: copied=%d missing=%d unsafe=%d",
-                        mr.copied, mr.missing, mr.skipped_unsafe);
+                        "Media: copied=%d missing=%d unsafe=%d entries=%d",
+                        mr.copied, mr.missing, mr.skipped_unsafe, mr.count);
+
+                    /* Convert source names such as an Anki media-map value
+                       to the exact normalized filename written on disk. */
+                    for (int di = 0; di < imported_deck->card_count; di++) {
+                        Card *card = &imported_deck->cards[di];
+                        for (int mi = 0; mi < card->media_ref_count; mi++) {
+                            char resolved[sizeof(card->media_refs[mi].ref)];
+                            if (media_import_resolve(&mr, card->media_refs[mi].ref,
+                                                     resolved, sizeof(resolved))) {
+                                snprintf(card->media_refs[mi].ref,
+                                         sizeof(card->media_refs[mi].ref), "%s", resolved);
+                            }
+                        }
+
+                        /* Rebuild the legacy first-image/first-audio aliases
+                           from the complete resolved list. */
+                        card->image_ref[0] = 0;
+                        card->audio_ref[0] = 0;
+                        for (int mi = 0; mi < card->media_ref_count; mi++) {
+                            if (card->media_refs[mi].kind == MEDIA_KIND_IMAGE && !card->image_ref[0])
+                                snprintf(card->image_ref, sizeof(card->image_ref), "%s",
+                                         card->media_refs[mi].ref);
+                            if (card->media_refs[mi].kind == MEDIA_KIND_AUDIO && !card->audio_ref[0])
+                                snprintf(card->audio_ref, sizeof(card->audio_ref), "%s",
+                                         card->media_refs[mi].ref);
+                        }
+                    }
                 }
                 media_import_free(&mr);
             }
 
             I.result_cards = I.run_card_index;
+            app_refresh_fonts(a);
             app_save(a);
 
             /* Achievement: FIRST_CARD fires when the user creates their

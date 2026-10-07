@@ -7,7 +7,7 @@
 #include "player/player.h"
 
 #define SAVE_MAGIC   0x53515631u   /* "SQV1" */
-#define SAVE_VERSION 5
+#define SAVE_VERSION 6
 
 typedef struct SaveData {
     DeckList decks;

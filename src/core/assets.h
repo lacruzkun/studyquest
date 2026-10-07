@@ -9,7 +9,7 @@
 
 typedef struct {
     Texture2D tex;
-    char      filename[256];
+    char      filename[512];
     bool      loaded;
     bool      failed;      /* NEW: don't retry a load that already failed */
     double    last_used;
@@ -17,7 +17,7 @@ typedef struct {
 
 typedef struct {
     Sound  snd;
-    char   filename[256];
+    char   filename[512];
     bool   loaded;
     bool   failed;         /* NEW */
     double last_used;

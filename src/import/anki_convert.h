@@ -6,16 +6,20 @@
 #include <stdbool.h>
 
 typedef struct {
-    /* Media refs found in the note's rendered fields. */
-    char media_refs[8][256];
+    /* Media refs found in note fields and card templates. */
+    char media_refs[ANKI_MAX_MEDIA_REFS][512];
+    unsigned char media_kinds[ANKI_MAX_MEDIA_REFS];
+    unsigned char media_sides[ANKI_MAX_MEDIA_REFS];
     int  media_ref_count;
 
     /* Every field of the note, cleaned and in order. Field 0 is the
-       prompt; the rest are the answer. */
+       prompt; the rest are the answer. Values are heap-owned. */
     int  field_count;
     char field_names[MAX_FIELDS][MAX_FIELD_NAME];
-    char field_values[MAX_FIELDS][MAX_FIELD_VALUE];
+    char *field_values[MAX_FIELDS];
 } ConvertedCard;
+
+void anki_converted_card_free(ConvertedCard *card);
 
 bool anki_convert_card(const AnkiCollection *col,
                        const AnkiCard *card,

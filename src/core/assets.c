@@ -136,9 +136,17 @@ Texture2D *assets_get_texture(AssetCache *ac, const char *filename) {
     snprintf(e->filename, sizeof(e->filename), "%s", filename);
     e->last_used = now_sec();
 
+    /* Media refs come from imported Anki data.  Use only the final
+       filename component so stale/legacy refs cannot escape media_root. */
+    const char *base = strrchr(filename, '/');
+    if (!base) base = strrchr(filename, '\\');
+    base = base ? base + 1 : filename;
+
     char path[1024];
-    snprintf(path, sizeof(path), "%s/images/%s", ac->media_root, filename);
+    snprintf(path, sizeof(path), "%s/images/%s", ac->media_root, base);
     if (!FileExists(path)) {
+        TraceLog(LOG_WARNING, "ASSETS: image file missing: ref='%s' path='%s'",
+                 filename, path);
         e->failed = true;
         return NULL;
     }
@@ -159,9 +167,15 @@ Texture2D *assets_get_texture(AssetCache *ac, const char *filename) {
         t = LoadTexture(path);
     }
     if (t.id == 0) {
+        TraceLog(LOG_WARNING, "ASSETS: image load failed: ref='%s' path='%s'",
+                 filename, path);
         e->failed = true;
         return NULL;
     }
+
+    e->tex = t;
+    e->loaded = true;
+    return &e->tex;
 }
 
 /* ------------------------------------------------------------------ */
@@ -203,12 +217,26 @@ Sound *assets_get_sound(AssetCache *ac, const char *filename) {
     snprintf(e->filename, sizeof(e->filename), "%s", filename);
     e->last_used = now_sec();
 
+    const char *base = strrchr(filename, '/');
+    if (!base) base = strrchr(filename, '\\');
+    base = base ? base + 1 : filename;
+
     char path[1024];
-    snprintf(path, sizeof(path), "%s/audio/%s", ac->media_root, filename);
-    if (!FileExists(path)) { e->failed = true; return NULL; }
+    snprintf(path, sizeof(path), "%s/audio/%s", ac->media_root, base);
+    if (!FileExists(path)) {
+        TraceLog(LOG_WARNING, "ASSETS: audio file missing: ref='%s' path='%s'",
+                 filename, path);
+        e->failed = true;
+        return NULL;
+    }
 
     Sound s = LoadSound(path);
-    if (s.frameCount == 0) { e->failed = true; return NULL; }
+    if (s.frameCount == 0) {
+        TraceLog(LOG_WARNING, "ASSETS: audio load failed: ref='%s' path='%s'",
+                 filename, path);
+        e->failed = true;
+        return NULL;
+    }
 
     e->snd = s;
     e->loaded = true;
