@@ -6,8 +6,14 @@
 #include <stddef.h>
 
 /* Convert Anki HTML to plain-ish text, collecting <img src="..."> and
-   [sound:...] references. The output text preserves <b>, <i>, <br>
-   as simple tags the card renderer already understands.
+   [sound:...] references.
+
+   Block-level tags (<p>, <div>, <li>, <tr>, headings, <br>, <hr>) become
+   line breaks. Inline formatting tags (<b>, <i>, <em>, <u>, <strong>,
+   <span>) are stripped, but their text content is preserved — StudyQuest's
+   centered Japanese renderer has no italic font and renders a single style,
+   so inline styling is flattened rather than shown as raw tags. HTML
+   entities (including numeric ones) are decoded to UTF-8.
 
    media_refs: array of char[512] to fill with referenced filenames.
    media_count: in/out — current count on entry, updated on exit. */

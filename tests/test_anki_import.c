@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -14,6 +15,7 @@
 #include "import/anki_parser.h"
 #include "import/media_importer.h"
 #include "import/anki_convert.h"
+#include "import/import_manager.h"
 #include "cards/cards.h"
 #include "storage/save.h"
 #include "player/player.h"
@@ -30,6 +32,375 @@
 static int file_size(const char *path) {
     struct stat st;
     return stat(path, &st) == 0 ? (int)st.st_size : -1;
+}
+
+/* Build the path to a sibling fixture next to the file in argv[1]. */
+static void fixture_path(const char *argv1, const char *name,
+                         char *out, size_t cap) {
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s", argv1);
+    char *slash = strrchr(dir, '/');
+    if (slash) slash[1] = 0;
+    else dir[0] = 0;
+    snprintf(out, cap, "%s%s", dir, name);
+}
+
+static int test_package_variants(const char *argv1) {
+    char path[1024];
+    char tmp[] = "/tmp/sq-variant-XXXXXX";
+    char *td = mkdtemp(tmp);
+    CHECK(td != NULL);
+
+    /* --- modern (zstd-compressed collection.anki21b) --------------- */
+    fixture_path(argv1, "modern.apkg", path, sizeof(path));
+    {
+        ApkgHandle h;
+        CHECK(apkg_open(path, td, &h));
+        CHECK(h.variant == APKG_VARIANT_MODERN);
+        CHECK(file_size(h.db_path) > 0);
+
+        AnkiCollection col;
+        CHECK(anki_parse(h.db_path, &col));
+        CHECK(col.note_count == 3);
+        CHECK(col.card_count == 3);
+        CHECK(col.model_count == 1);
+
+        bool found_konnichiwa = false, found_taberu = false, found_gakusei = false;
+        for (int i = 0; i < col.note_count; i++) {
+            if (col.notes[i].fields[0] &&
+                strcmp(col.notes[i].fields[0], "こんにちは") == 0) found_konnichiwa = true;
+            if (col.notes[i].fields[0] &&
+                strcmp(col.notes[i].fields[0], "食べる") == 0) found_taberu = true;
+            if (col.notes[i].fields[0] &&
+                strcmp(col.notes[i].fields[0], "学生") == 0) found_gakusei = true;
+        }
+        CHECK(found_konnichiwa);
+        CHECK(found_taberu);
+        CHECK(found_gakusei);
+
+        /* Deck ids must come from the JSON object keys, not the value
+           nodes (regression: decks id was always 0). */
+        bool deck1 = false, deck2 = false;
+        for (int i = 0; i < col.deck_count; i++) {
+            if (col.decks[i].id == 1 &&
+                strcmp(col.decks[i].name, "Japanese::Vocabulary") == 0) deck1 = true;
+            if (col.decks[i].id == 2 &&
+                strcmp(col.decks[i].name, "Japanese::Kanji") == 0) deck2 = true;
+        }
+        CHECK(deck1);
+        CHECK(deck2);
+        CHECK(col.models[0].id == 1700000000000LL);
+
+        anki_collection_free(&col);
+        remove(h.db_path);
+        remove(h.media_json_path);
+    }
+
+    /* --- legacy2 (collection.anki21 + dummy collection.anki2) ------ */
+    fixture_path(argv1, "legacy2.apkg", path, sizeof(path));
+    {
+        ApkgHandle h;
+        CHECK(apkg_open(path, td, &h));
+        CHECK(h.variant == APKG_VARIANT_LEGACY2);
+
+        AnkiCollection col;
+        CHECK(anki_parse(h.db_path, &col));
+        CHECK(col.note_count == 3);
+        CHECK(col.card_count == 3);
+        anki_collection_free(&col);
+        remove(h.db_path);
+        remove(h.media_json_path);
+    }
+
+    /* --- a ZIP that contains no collection file -------------------- */
+    fixture_path(argv1, "invalid_no_collection.apkg", path, sizeof(path));
+    {
+        ApkgHandle h;
+        CHECK(!apkg_open(path, td, &h));
+    }
+
+    /* --- a file that is not a ZIP at all --------------------------- */
+    fixture_path(argv1, "invalid_corrupt.apkg", path, sizeof(path));
+    {
+        ApkgHandle h;
+        CHECK(!apkg_open(path, td, &h));
+    }
+
+    rmdir(td);
+    return 0;
+}
+
+static int test_scheduling(void) {
+    AnkiCard ac = {0};
+    ac.type = 2;   /* review */
+    ac.ivl = 30;
+    ac.factor = 2600;
+    ac.reps = 7;
+    ac.lapses = 2;
+    ac.mod = 1700000000;
+
+    Card c = {0};
+    import_apply_scheduling(&ac, &c);
+    CHECK(c.state == CARD_REVIEW);
+    CHECK(c.interval_sec == 30.0 * 86400.0);
+    CHECK(c.ease >= 2.599f && c.ease <= 2.601f);
+    CHECK(c.reps == 7);
+    CHECK(c.lapses == 2);
+    CHECK(c.due <= (double)time(NULL));
+
+    /* New card stays new. */
+    AnkiCard nc = {0};
+    nc.type = 0;
+    nc.factor = 2500;
+    Card ncard = {0};
+    import_apply_scheduling(&nc, &ncard);
+    CHECK(ncard.state == CARD_NEW);
+    return 0;
+}
+
+static int test_duplicate_and_commit(const char *argv1) {
+    char path[1024];
+    char tmp[] = "/tmp/sq-commit-XXXXXX";
+    char *td = mkdtemp(tmp);
+    CHECK(td != NULL);
+
+    fixture_path(argv1, "modern.apkg", path, sizeof(path));
+    ApkgHandle h;
+    CHECK(apkg_open(path, td, &h));
+    CHECK(h.variant == APKG_VARIANT_MODERN);
+    AnkiCollection col;
+    CHECK(anki_parse(h.db_path, &col));
+
+    DeckList app;
+    decklist_init(&app);
+
+    /* First import (NEW) into a scratch buffer, then commit. */
+    {
+        DeckList scratch;
+        decklist_init(&scratch);
+        ImportJob job;
+        import_job_init(&job, &col, NULL, &scratch);
+        while (!import_job_done(&job)) import_job_step(&job, 16);
+        import_job_free(&job);
+
+        ImportWarnings w;
+        import_warnings_init(&w);
+        CHECK(import_commit(&app, &scratch, IMPORT_MODE_NEW, &w));
+        decklist_free(&scratch);
+    }
+    CHECK(app.count == 2);
+
+    Deck *vocab = import_find_existing_deck(&app, "Japanese::Vocabulary");
+    Deck *kanji = import_find_existing_deck(&app, "Japanese::Kanji");
+    CHECK(vocab != NULL && kanji != NULL);
+    CHECK(vocab->card_count == 2);
+    CHECK(kanji->card_count == 1);
+    CHECK(vocab->cards[0].anki_card_id != 0);   /* id preserved for dedup */
+
+    /* Second import (UPDATE) must not duplicate any cards. */
+    {
+        DeckList scratch;
+        decklist_init(&scratch);
+        ImportJob job;
+        import_job_init(&job, &col, NULL, &scratch);
+        while (!import_job_done(&job)) import_job_step(&job, 16);
+        import_job_free(&job);
+
+        ImportWarnings w;
+        import_warnings_init(&w);
+        CHECK(import_commit(&app, &scratch, IMPORT_MODE_UPDATE, &w));
+        decklist_free(&scratch);
+    }
+    CHECK(app.count == 2);
+    CHECK(vocab->card_count == 2);   /* still 2, no duplicates */
+    CHECK(kanji->card_count == 1);
+
+    /* A failed conversion must leave the app untouched (atomicity): build a
+       scratch, then simply discard it instead of committing. */
+    {
+        DeckList scratch;
+        decklist_init(&scratch);
+        ImportJob job;
+        import_job_init(&job, &col, NULL, &scratch);
+        while (!import_job_done(&job)) import_job_step(&job, 16);
+        import_job_free(&job);
+        decklist_free(&scratch);   /* discard — app must be unchanged */
+    }
+    CHECK(app.count == 2);
+    CHECK(vocab->card_count == 2);
+
+    decklist_free(&app);
+    anki_collection_free(&col);
+    remove(h.db_path);
+    remove(h.media_json_path);
+    rmdir(td);
+    return 0;
+}
+
+static int test_media_edge_cases(const char *argv1) {
+    char apkg[1024];
+    fixture_path(argv1, "anki_media.apkg", apkg, sizeof(apkg));
+
+    char tmp[] = "/tmp/sq-media-edge-XXXXXX";
+    char *td = mkdtemp(tmp);
+    CHECK(td != NULL);
+
+    char media_json[1024], media_dir[1024];
+    snprintf(media_json, sizeof(media_json), "%s/media", td);
+    snprintf(media_dir,  sizeof(media_dir),  "%s/out", td);
+
+    /* --- missing media entry: recoverable, not fatal --------------- */
+    {
+        FILE *f = fopen(media_json, "wb");
+        CHECK(f != NULL);
+        fputs("{\"0\": \"front.webp\", \"99\": \"missing.mp3\"}", f);
+        fclose(f);
+
+        MediaImportResult mr;
+        CHECK(media_import_all(apkg, media_json, media_dir, NULL, NULL, &mr));
+        CHECK(mr.copied == 1);
+        CHECK(mr.missing == 1);
+        CHECK(mr.skipped_unsafe == 0);
+        media_import_free(&mr);
+        remove(media_json);
+    }
+
+    /* --- path traversal: neutralized to basename, never escapes ----- */
+    {
+        FILE *f = fopen(media_json, "wb");
+        CHECK(f != NULL);
+        fputs("{\"0\": \"../../etc/passwd\"}", f);
+        fclose(f);
+
+        MediaImportResult mr;
+        CHECK(media_import_all(apkg, media_json, media_dir, NULL, NULL, &mr));
+        CHECK(mr.copied == 1);   /* sanitized to basename and imported */
+        CHECK(mr.missing == 0);
+
+        char outside[1024];
+        snprintf(outside, sizeof(outside), "%s/etc/passwd", td);
+        CHECK(file_size(outside) < 0);   /* must not have escaped */
+        media_import_free(&mr);
+        remove(media_json);
+    }
+
+    /* --- non-numeric archive entry key: skipped as unsafe ----------- */
+    {
+        FILE *f = fopen(media_json, "wb");
+        CHECK(f != NULL);
+        fputs("{\"evil/path\": \"cat.jpg\"}", f);
+        fclose(f);
+
+        MediaImportResult mr;
+        CHECK(media_import_all(apkg, media_json, media_dir, NULL, NULL, &mr));
+        CHECK(mr.skipped_unsafe == 1);
+        CHECK(mr.copied == 0);
+        media_import_free(&mr);
+        remove(media_json);
+    }
+
+    /* --- malformed media map (not JSON): structural failure --------- */
+    {
+        FILE *f = fopen(media_json, "wb");
+        CHECK(f != NULL);
+        fputs("this is not json {", f);
+        fclose(f);
+
+        MediaImportResult mr;
+        CHECK(!media_import_all(apkg, media_json, media_dir, NULL, NULL, &mr));
+        CHECK(mr.error[0] != 0);
+        media_import_free(&mr);
+        remove(media_json);
+    }
+
+    /* --- import_warn_media folds counts into human warnings -------- */
+    {
+        ImportWarnings w;
+        import_warnings_init(&w);
+        MediaImportResult mr;
+        memset(&mr, 0, sizeof(mr));
+        mr.missing = 3;
+        mr.skipped_unsafe = 2;
+        import_warn_media(&w, &mr);
+        CHECK(w.count == 2);
+        CHECK(strstr(w.message, "missing") != NULL);
+        CHECK(strstr(w.message, "not safe") != NULL);
+    }
+
+    rmdir(td);
+    return 0;
+}
+
+static int test_import_manager(const char *argv1) {
+    char path[1024];
+    char tmp[] = "/tmp/sq-manager-XXXXXX";
+    char *td = mkdtemp(tmp);
+    CHECK(td != NULL);
+
+    fixture_path(argv1, "modern.apkg", path, sizeof(path));
+    ApkgHandle h;
+    CHECK(apkg_open(path, td, &h));
+    CHECK(h.variant == APKG_VARIANT_MODERN);
+
+    AnkiCollection col;
+    CHECK(anki_parse(h.db_path, &col));
+
+    /* Deck plan: two distinct decks, full "::" names, correct counts. */
+    ImportDeckPlan plan;
+    CHECK(import_build_deck_plan(&col, &plan));
+    CHECK(plan.deck_count == 2);
+
+    const ImportDeckSummary *vocab = NULL, *kanji = NULL;
+    for (int i = 0; i < plan.deck_count; i++) {
+        if (strcmp(plan.decks[i].name, "Japanese::Vocabulary") == 0) vocab = &plan.decks[i];
+        if (strcmp(plan.decks[i].name, "Japanese::Kanji") == 0) kanji = &plan.decks[i];
+    }
+    CHECK(vocab != NULL);
+    CHECK(kanji != NULL);
+    CHECK(vocab->card_count == 2);
+    CHECK(vocab->note_count == 2);
+    CHECK(kanji->card_count == 1);
+    CHECK(kanji->note_count == 1);
+
+    /* Run the job one card at a time into a fresh deck list. */
+    DeckList dl;
+    decklist_init(&dl);
+    ImportJob job;
+    import_job_init(&job, &col, NULL, &dl);
+    while (!import_job_done(&job)) import_job_step(&job, 1);
+    CHECK(job.cards_added == 3);
+    CHECK(job.notes_added == 3);
+    CHECK(dl.count == 2);
+
+    Deck *d_vocab = NULL, *d_kanji = NULL;
+    for (int i = 0; i < dl.count; i++) {
+        if (strcmp(dl.decks[i].name, "Japanese::Vocabulary") == 0) d_vocab = &dl.decks[i];
+        if (strcmp(dl.decks[i].name, "Japanese::Kanji") == 0) d_kanji = &dl.decks[i];
+    }
+    CHECK(d_vocab != NULL && d_kanji != NULL);
+    CHECK(d_vocab->card_count == 2);
+    CHECK(d_kanji->card_count == 1);
+
+    /* Japanese text and tags survive into the StudyQuest cards. */
+    bool konnichiwa = false, tags_ok = false;
+    for (int i = 0; i < d_vocab->card_count; i++) {
+        const char *v = card_field_value(&d_vocab->cards[i], 0);
+        if (v && strcmp(v, "こんにちは") == 0) {
+            konnichiwa = true;
+            if (strcmp(d_vocab->cards[i].tags, "jlpt-n5,vocabulary") == 0) tags_ok = true;
+        }
+    }
+    CHECK(konnichiwa);
+    CHECK(tags_ok);
+    CHECK(card_field_value(&d_vocab->cards[0], 1) != NULL); /* second field preserved */
+
+    import_job_free(&job);
+    decklist_free(&dl);
+    anki_collection_free(&col);
+    remove(h.db_path);
+    remove(h.media_json_path);
+    rmdir(td);
+    return 0;
 }
 
 static int test_utf8(void) {
@@ -79,6 +450,43 @@ static int test_html(void) {
     CHECK(strcmp(refs[2], "back.webp") == 0);
     CHECK(strcmp(refs[3], "back.wav") == 0);
     CHECK(strcmp(refs[4], "back2.wav") == 0);
+    return 0;
+}
+
+static int test_html_formatting(void) {
+    char text[1024];
+
+    /* Inline formatting tags are stripped, text preserved. */
+    anki_html_to_text("<b>bold</b> <i>italic</i> <em>em</em> <u>under</u> <strong>strong</strong>",
+                      text, sizeof(text));
+    CHECK(strcmp(text, "bold italic em under strong") == 0);
+
+    /* Block-level tags become line breaks. */
+    anki_html_to_text("<p>para one</p><p>para two</p>", text, sizeof(text));
+    CHECK(strcmp(text, "para one\npara two") == 0);
+
+    anki_html_to_text("<div>a</div><div>b</div>", text, sizeof(text));
+    CHECK(strcmp(text, "a\nb") == 0);
+
+    anki_html_to_text("line1<br>line2", text, sizeof(text));
+    CHECK(strcmp(text, "line1\nline2") == 0);
+
+    anki_html_to_text("<ul><li>one</li><li>two</li></ul>", text, sizeof(text));
+    CHECK(strcmp(text, "one\ntwo") == 0);
+
+    /* No raw tags must leak. */
+    anki_html_to_text("<b><i><u>formatted</u></i></b>", text, sizeof(text));
+    CHECK(strstr(text, "<") == NULL);
+
+    /* Japanese HTML: content and entities preserved, tags stripped. */
+    anki_html_to_text("<p>日本語を<b>勉強</b>しています。&#x3002;</p>",
+                      text, sizeof(text));
+    CHECK(strstr(text, "日本語を勉強しています。") != NULL);
+    CHECK(strstr(text, "<") == NULL);
+
+    /* Trailing whitespace is trimmed. */
+    anki_html_to_text("spaced   text  ", text, sizeof(text));
+    CHECK(strcmp(text, "spaced   text") == 0);
     return 0;
 }
 
@@ -196,6 +604,20 @@ int main(int argc, char **argv) {
 
     printf("== HTML/media reference extraction ==\n");
     if (test_html() != 0) return 1;
+    if (test_html_formatting() != 0) return 1;
+
+    printf("== package variants & safe failure ==\n");
+    if (test_package_variants(argv[1]) != 0) return 1;
+
+    printf("== import manager (deck grouping) ==\n");
+    if (test_import_manager(argv[1]) != 0) return 1;
+
+    printf("== media edge cases ==\n");
+    if (test_media_edge_cases(argv[1]) != 0) return 1;
+
+    printf("== scheduling, duplicates, commit ==\n");
+    if (test_scheduling() != 0) return 1;
+    if (test_duplicate_and_commit(argv[1]) != 0) return 1;
 
     char tmp[] = "/tmp/studyquest-import-test-XXXXXX";
     char *tmpdir = mkdtemp(tmp);

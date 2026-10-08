@@ -76,6 +76,7 @@ static bool write_card(FILE *f, const Card *c) {
         if (!w_i32(f, c->media_refs[i].side)) return false;
         if (!w_i32(f, c->media_refs[i].field_index)) return false;
     }
+    if (!w_i64(f, c->anki_card_id)) return false;
     return true;
 }
 
@@ -157,6 +158,16 @@ static bool read_card(FILE *f, Card *c, int save_version) {
         if (c->image_ref[0]) card_add_media_ref(c, c->image_ref, 0, 0, 0);
         if (c->audio_ref[0]) card_add_media_ref(c, c->audio_ref, 1, 0, 0);
     }
+
+    /* Anki card identity (v8+). Older saves leave it at 0. */
+    if (save_version >= 8) {
+        if (!r_i64(f, &c->anki_card_id)) {
+            card_free(c);
+            return false;
+        }
+    } else {
+        c->anki_card_id = 0;
+    }
     return true;
 }
 
@@ -186,11 +197,21 @@ static bool read_deck(FILE *f, Deck *d, int save_version) {
     if (cc < 0 || cc > MAX_CARDS) return false;
     d->id = id;
     d->card_count = cc;
-    for (int i = 0; i < cc; i++)
+    if (cc > 0) {
+        d->cards = (Card *)calloc((size_t)cc, sizeof(Card));
+        if (!d->cards) return false;
+        d->card_capacity = cc;
+    }
+    for (int i = 0; i < cc; i++) {
         if (!read_card(f, &d->cards[i], save_version)) {
             for (int j = 0; j < i; j++) card_free(&d->cards[j]);
+            free(d->cards);
+            d->cards = NULL;
+            d->card_capacity = 0;
+            d->card_count = 0;
             return false;
         }
+    }
     return true;
 }
 

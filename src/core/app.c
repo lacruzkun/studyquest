@@ -63,6 +63,8 @@ void app_destroy(App *a) {
     app_save(a);
     fonts_free(&a->fonts);
     assets_free(&a->assets);
+    free(a->session.queue);
+    a->session.queue = NULL;
     decklist_free(&a->data.decks);
     RL_FREE(a);
 }
@@ -112,12 +114,19 @@ void app_start_session(App *a, int deck_id) {
     if (!d || d->card_count == 0) { app_toast(a, "Nothing to study.", TH.warning); return; }
 
     StudySession *s = &a->session;
+    free(s->queue);
     memset(s, 0, sizeof(*s));
     s->deck_id = deck_id;
 
+    /* Pre-allocate the queue for the worst case: every card is due. */
+    int cap = d->card_count > 0 ? d->card_count : 1;
+    s->queue = (int *)malloc(sizeof(int) * (size_t)cap);
+    if (!s->queue) { app_toast(a, "Out of memory.", TH.danger); return; }
+    s->queue_cap = cap;
+
     double now = (double)time(NULL);
     for (int i = 0; i < d->card_count; i++)
-        if (scheduler_card_due(&d->cards[i], now) && s->queue_len < MAX_CARDS)
+        if (scheduler_card_due(&d->cards[i], now))
             s->queue[s->queue_len++] = i;
 
     if (s->queue_len == 0) {

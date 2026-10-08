@@ -37,6 +37,10 @@ bool anki_json_parse_models(const char *json, AnkiModel **out, int *count, char 
         cJSON *tmpl = cJSON_GetObjectItem(m, "tmpls");
 
         am->id = id ? (int64_t)id->valuedouble : 0;
+        /* Fall back to the JSON object key (the canonical model id) when
+           the "id" field is missing or zero. */
+        if (am->id == 0 && m->string)
+            am->id = (int64_t)strtoll(m->string, NULL, 10);
         copy_str(am->name, sizeof(am->name), name ? name->valuestring : "");
         am->is_cloze = (type && type->valueint == 1);
 
@@ -94,7 +98,9 @@ bool anki_json_parse_decks(const char *json, AnkiDeck **out, int *count, char *e
         AnkiDeck *ad = &arr[i++];
         cJSON *name = cJSON_GetObjectItem(d, "name");
         cJSON *dyn  = cJSON_GetObjectItem(d, "dyn");
-        ad->id = (int64_t)d->valuedouble;  /* object key is the deck id */
+        /* The deck id is the JSON object key ("1", "2", ...), not the
+           value node. `d->string` holds that key during object iteration. */
+        ad->id = d->string ? (int64_t)strtoll(d->string, NULL, 10) : 0;
         copy_str(ad->name, sizeof(ad->name), name ? name->valuestring : "");
         ad->is_filtered = dyn && dyn->valueint == 1;
     }

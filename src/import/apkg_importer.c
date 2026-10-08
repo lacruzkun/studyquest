@@ -6,8 +6,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #include <errno.h>
+
+/* Untrusted-input guards. Anki packages are normally a few MB; these caps
+   exist purely to stop hostile/corrupt archives from exhausting memory. */
+#define APKG_MAX_ARCHIVE_ENTRIES         1000000u
+#define APKG_MAX_COLLECTION_RAW          (512ull * 1024 * 1024)   /* .anki2/.anki21 */
+#define APKG_MAX_COLLECTION_ZSTD_COMP    (512ull * 1024 * 1024)   /* .anki21b, compressed */
+#define APKG_MAX_COLLECTION_ZSTD_DECOMP  (2ull * 1024 * 1024 * 1024)
+#define APKG_MAX_MEDIA_MAP               (32ull * 1024 * 1024)
 
 /* --- small helpers ---------------------------------------------- */
 
@@ -47,9 +56,23 @@ static bool safe_entry_name(const char *name) {
 }
 
 /* Extract one archive entry to disk. Returns the number of bytes written,
-   or -1 on failure. */
+   or -1 on failure. Rejects entries larger than `max_size` before allocating. */
+static bool entry_uncompressed_size(mz_zip_archive *zip, const char *name,
+                                    uint64_t *out) {
+    int idx = mz_zip_reader_locate_file(zip, name, NULL, 0);
+    if (idx < 0) return false;
+    mz_zip_archive_file_stat st;
+    if (!mz_zip_reader_file_stat(zip, idx, &st)) return false;
+    *out = st.m_uncomp_size;
+    return true;
+}
+
 static long extract_entry_to_file(mz_zip_archive *zip, const char *entry_name,
-                                  const char *dest_path) {
+                                  const char *dest_path, uint64_t max_size) {
+    uint64_t usz = 0;
+    if (!entry_uncompressed_size(zip, entry_name, &usz) || usz > max_size)
+        return -1;
+
     size_t size = 0;
     void *data = mz_zip_reader_extract_file_to_heap(zip, entry_name, &size, 0);
     if (!data) return -1;
@@ -67,13 +90,19 @@ static long extract_entry_to_file(mz_zip_archive *zip, const char *entry_name,
 /* Extract one entry, zstd-decompress it, write the result. */
 static long extract_entry_zstd_to_file(mz_zip_archive *zip, const char *entry_name,
                                        const char *dest_path) {
+    uint64_t usz = 0;
+    if (!entry_uncompressed_size(zip, entry_name, &usz) ||
+        usz > APKG_MAX_COLLECTION_ZSTD_COMP)
+        return -1;
+
     size_t size = 0;
     void *data = mz_zip_reader_extract_file_to_heap(zip, entry_name, &size, 0);
     if (!data) return -1;
 
     unsigned long long decompressed_size = ZSTD_getFrameContentSize(data, size);
     if (decompressed_size == ZSTD_CONTENTSIZE_ERROR ||
-        decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN) {
+        decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN ||
+        decompressed_size > APKG_MAX_COLLECTION_ZSTD_DECOMP) {
         mz_free(data);
         return -1;
     }
@@ -125,6 +154,14 @@ bool apkg_open(const char *apkg_path, const char *tmp_dir, ApkgHandle *out) {
         return false;
     }
 
+    /* Reject archives with an implausible number of entries up front. */
+    if (mz_zip_reader_get_num_files(&zip) > APKG_MAX_ARCHIVE_ENTRIES) {
+        snprintf(out->error, sizeof(out->error),
+                 "The package contains too many files and will not be imported.");
+        mz_zip_reader_end(&zip);
+        return false;
+    }
+
     /* Look for the three possible collection filenames. The order matters:
        we prefer the newest variant first so that a package containing both
        a real collection.anki21 and a dummy collection.anki2 is handled
@@ -168,7 +205,8 @@ bool apkg_open(const char *apkg_path, const char *tmp_dir, ApkgHandle *out) {
             return false;
         }
     } else {
-        n = extract_entry_to_file(&zip, real_db_entry, out->db_path);
+        n = extract_entry_to_file(&zip, real_db_entry, out->db_path,
+                                  APKG_MAX_COLLECTION_RAW);
         if (n < 0) {
             snprintf(out->error, sizeof(out->error),
                      "Failed to extract %s from the archive.", real_db_entry);
@@ -181,7 +219,8 @@ bool apkg_open(const char *apkg_path, const char *tmp_dir, ApkgHandle *out) {
     if (mz_zip_reader_locate_file(&zip, "media", NULL, 0) >= 0) {
         snprintf(out->media_json_path, sizeof(out->media_json_path),
                  "%s/media", tmp_dir);
-        if (extract_entry_to_file(&zip, "media", out->media_json_path) < 0) {
+        if (extract_entry_to_file(&zip, "media", out->media_json_path,
+                                  APKG_MAX_MEDIA_MAP) < 0) {
             out->media_json_path[0] = 0;
         }
     }

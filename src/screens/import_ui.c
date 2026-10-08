@@ -6,13 +6,15 @@
 #include "import/anki_parser.h"
 #include "import/anki_convert.h"
 #include "import/media_importer.h"
+#include "import/import_manager.h"
 
 #include <stdio.h>
-#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <inttypes.h>
 
@@ -20,47 +22,69 @@
 /*  State                                                              */
 /* ================================================================== */
 
+#define IMP_MAX_ENTRIES 256
+
 typedef enum {
     IMP_IDLE = 0,
-    IMP_ENTER_PATH,
+    IMP_BROWSE,
     IMP_PREVIEW,
+    IMP_DUP,
     IMP_RUNNING,
     IMP_DONE,
     IMP_ERROR
 } ImportPhase;
 
+typedef enum {
+    RUN_MEDIA = 0,
+    RUN_CARDS,
+    RUN_COMMIT
+} RunSub;
+
+typedef struct {
+    char  name[256];
+    bool  is_dir;
+    bool  is_apkg;
+} BrowseEntry;
+
 typedef struct {
     ImportPhase phase;
     float phase_t;
 
-    char path_input[MAX_TEXT];
-    bool path_field_active;
+    /* Browser */
+    char        browse_dir[512];
+    BrowseEntry entries[IMP_MAX_ENTRIES];
+    int         entry_count;
+    int         scroll;
+    int         selected;
 
-    /* Package under inspection */
-    ApkgHandle     handle;
+    /* Selected package + parsed collection */
+    char          apkg_path[512];
+    ApkgHandle    handle;
     AnkiCollection col;
-    bool have_handle;
-    bool have_col;
-    char tmp_dir[512];
+    bool          have_handle;
+    bool          have_col;
+    char          tmp_dir[512];
 
     /* Preview */
-    char preview_name[MAX_DECK_NAME];
-    int  preview_notes;
-    int  preview_cards;
-    int  preview_models;
-    int  preview_media;
+    ImportDeckPlan plan;
+    int            preview_models;
+    int            preview_media;
+    bool           dup_any;
 
     /* Running */
-    int  run_card_index;     /* next card to process */
-    int  run_deck_id;        /* StudyQuest deck we're adding to */
-    bool run_started;
+    ImportMode       mode;
+    DeckList         scratch;
+    ImportJob        job;
+    MediaImportResult media;
+    RunSub           run_sub;
+    bool             run_started;
 
     /* Result */
-    int  result_cards;
-    char result_deck_name[MAX_DECK_NAME];
-    int  result_deck_id;
+    int             result_cards;
+    int             result_notes;
+    ImportWarnings  warnings;
 
-    char error[1024];       /* was 512 */
+    char error[1024];
 } ImportUI;
 
 static ImportUI I;
@@ -79,150 +103,94 @@ static void cleanup_temp(void) {
     I.tmp_dir[0] = 0;
 }
 
-static void close_modal(void) {
+static void reset_state(void) {
     cleanup_temp();
     if (I.have_col) { anki_collection_free(&I.col); I.have_col = false; }
     if (I.have_handle) { apkg_close(&I.handle); I.have_handle = false; }
+    media_import_free(&I.media);
+    import_job_free(&I.job);
+    decklist_free(&I.scratch);
+    memset(&I, 0, sizeof(I));
     I.phase = IMP_IDLE;
 }
 
-static void expand_tilde(const char *in, size_t in_cap, char *out, size_t cap) {
-    if (!out || cap == 0) return;
-    if (!in || in_cap == 0) { out[0] = 0; return; }
+static void close_modal(void) { reset_state(); }
 
-    if (in[0] == '~' && in_cap >= 2 && (in[1] == '/' || in[1] == 0)) {
-        const char *home = getenv("HOME");
-        if (!home || !*home) home = ".";
-
-        size_t hlen = strnlen(home, cap - 1);
-        size_t w = hlen < cap ? hlen : cap - 1;
-        memcpy(out, home, w);
-
-        size_t rest_max = in_cap - 1;
-        size_t room     = cap - w - 1;
-        size_t rlen     = strnlen(in + 1, rest_max < room ? rest_max : room);
-        memcpy(out + w, in + 1, rlen);
-        out[w + rlen] = 0;
-    } else {
-        size_t len = strnlen(in, in_cap - 1);
-        if (len > cap - 1) len = cap - 1;
-        memcpy(out, in, len);
-        out[len] = 0;
-    }
-}
-
-/* Path to the media directory (~/.studyquest/media). */
 static void media_root(char *out, size_t cap) {
     const char *home = getenv("HOME");
     if (!home) home = ".";
     snprintf(out, cap, "%s/.studyquest/media", home);
 }
 
-/* Find a deck name that doesn't collide with an existing StudyQuest deck. */
-static bool unique_deck_name(App *a, const char *base,
-                             char *out, size_t cap) {
-    /* Ensure the base leaves room for a numeric suffix like " (999)". */
-    char trimmed[MAX_DECK_NAME];
-    snprintf(trimmed, sizeof(trimmed), "%.*s",
-             MAX_DECK_NAME - 8, base ? base : "");
-    base = trimmed;
-
-    bool taken = false;
-    for (int i = 0; i < a->data.decks.count; i++) {
-        if (strcmp(a->data.decks.decks[i].name, base) == 0) {
-            taken = true;
-            break;
-        }
-    }
-    if (!taken) {
-        snprintf(out, cap, "%.*s", (int)(cap - 1), base);
-        return true;
-    }
-
-    for (int n = 2; n < 1000; n++) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "%s (%d)", base, n);
-        bool found = false;
-        for (int i = 0; i < a->data.decks.count; i++) {
-            if (strcmp(a->data.decks.decks[i].name, buf) == 0) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            snprintf(out, cap, "%.*s", (int)(cap - 1), buf);
-            return true;
-        }
-    }
-    return false;
-}
-
-/* Compute the top-level name from a possibly nested Anki deck name. */
-static void top_level_name(const char *anki_name, char *out, size_t cap) {
-    const char *sep = strstr(anki_name, "::");
-    size_t n = sep ? (size_t)(sep - anki_name) : strlen(anki_name);
-    if (n >= cap) n = cap - 1;
-    memcpy(out, anki_name, n);
-    out[n] = 0;
-    while (n > 0 && out[n - 1] == ' ') out[--n] = 0;
-}
-
-/* Convert Anki's " jlpt-n5 vocabulary " to "jlpt-n5,vocabulary". */
-static void anki_tags_to_csv(const char *anki_tags, char *out, size_t cap) {
-    out[0] = 0;
-    if (!anki_tags || !*anki_tags) return;
-    size_t w = 0;
-    const char *p = anki_tags;
-    while (*p && w + 1 < cap) {
-        while (*p == ' ') p++;
-        if (!*p) break;
-        const char *start = p;
-        while (*p && *p != ' ') p++;
-        size_t len = (size_t)(p - start);
-        if (w > 0 && w + 1 < cap) out[w++] = ',';
-        size_t n = len < (cap - w - 1) ? len : (cap - w - 1);
-        memcpy(out + w, start, n);
-        w += n;
-    }
-    out[w] = 0;
-}
-
 /* ================================================================== */
-/*  Public entry points                                                */
+/*  File browser                                                       */
 /* ================================================================== */
 
-void import_ui_start(App *a) {
-    (void)a;
-    memset(&I, 0, sizeof(I));
-    I.phase = IMP_ENTER_PATH;
-    I.phase_t = 0.f;
-    I.path_field_active = true;
-    const char *home = getenv("HOME");
-    if (home) snprintf(I.path_input, sizeof(I.path_input), "%s/", home);
+static bool has_apkg_ext(const char *name) {
+    const char *dot = strrchr(name, '.');
+    return dot && strcasecmp(dot, ".apkg") == 0;
 }
 
-/* Open the package and parse the collection. Blocks for ~50 ms on
-   typical decks (ZIP central directory + one file extraction + SQLite
-   open). Fills I.error on failure. */
-static bool open_and_parse(void) {
-    char path[512];
-    expand_tilde(I.path_input, sizeof(I.path_input), path, sizeof(path));
+static int browse_cmp(const void *a, const void *b) {
+    const BrowseEntry *ea = a, *eb = b;
+    if (ea->is_dir != eb->is_dir) return ea->is_dir ? -1 : 1;
+    return strcasecmp(ea->name, eb->name);
+}
 
-    /* Validate extension — we only accept .apkg here. */
-    const char *dot = strrchr(path, '.');
-    if (!dot || strcasecmp(dot, ".apkg") != 0) {
-        snprintf(I.error, sizeof(I.error),
-                 "The file must have a .apkg extension.\n"
-                 "Selected: %.450s", path);
-        return false;
+static void browse_scan(const char *dir) {
+    snprintf(I.browse_dir, sizeof(I.browse_dir), "%s", dir);
+    I.entry_count = 0;
+    I.scroll = 0;
+    I.selected = 0;
+
+    DIR *d = opendir(dir);
+    if (!d) return;
+
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && I.entry_count < IMP_MAX_ENTRIES) {
+        if (strcmp(e->d_name, ".") == 0) continue;
+        char full[600];
+        snprintf(full, sizeof(full), "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (stat(full, &st) != 0) continue;
+
+        bool is_dir = S_ISDIR(st.st_mode);
+        bool is_apkg = !is_dir && S_ISREG(st.st_mode) && has_apkg_ext(e->d_name);
+        if (!is_dir && !is_apkg) continue;
+
+        BrowseEntry *be = &I.entries[I.entry_count++];
+        snprintf(be->name, sizeof(be->name), "%s", e->d_name);
+        be->is_dir = is_dir;
+        be->is_apkg = is_apkg;
     }
+    closedir(d);
+    qsort(I.entries, (size_t)I.entry_count, sizeof(BrowseEntry), browse_cmp);
+}
 
-    /* Temp directory via mkdtemp. */
+static void browse_up(void) {
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s", I.browse_dir);
+    char *slash = strrchr(dir, '/');
+    if (!slash) return;
+    if (slash == dir) slash[1] = 0;   /* stay at root */
+    else *slash = 0;
+    browse_scan(dir);
+}
+
+/* Open the selected .apkg and parse the collection. */
+static bool open_selected(void) {
+    if (I.selected < 0 || I.selected >= I.entry_count) return false;
+    BrowseEntry *be = &I.entries[I.selected];
+    if (!be->is_apkg) return false;
+
+    char path[600];
+    snprintf(path, sizeof(path), "%s/%s", I.browse_dir, be->name);
+    snprintf(I.apkg_path, sizeof(I.apkg_path), "%s", path);
+
     char tmpl[] = "/tmp/studyquest_XXXXXX";
     char *td = mkdtemp(tmpl);
     if (!td) {
-        snprintf(I.error, sizeof(I.error),
-                 "Could not create a temporary directory under /tmp.");
+        snprintf(I.error, sizeof(I.error), "Could not create a temporary directory.");
         return false;
     }
     snprintf(I.tmp_dir, sizeof(I.tmp_dir), "%s", td);
@@ -239,96 +207,97 @@ static bool open_and_parse(void) {
     }
     I.have_col = true;
 
-    /* Preview stats. */
-    I.preview_notes  = I.col.note_count;
-    I.preview_cards  = I.col.card_count;
-    I.preview_models = I.col.model_count;
-    I.preview_media  = I.handle.media_entry_count;
-
     if (I.col.card_count == 0) {
         snprintf(I.error, sizeof(I.error),
-                 "The package contains no cards.\n"
-                 "If this is a Legacy 2 package, StudyQuest should have\n"
-                 "found collection.anki21 automatically — please report.");
+                 "The package contains no cards.");
         return false;
     }
 
-    /* Deck name: top-level of the first card's deck. */
-    char raw[256] = "Imported Deck";
-    if (I.col.card_count > 0) {
-        int64_t did = I.col.cards[0].did;
-        for (int i = 0; i < I.col.deck_count; i++) {
-            if (I.col.decks[i].id == did) {
-                snprintf(raw, sizeof(raw), "%s", I.col.decks[i].name);
-                break;
-            }
-        }
+    if (!import_build_deck_plan(&I.col, &I.plan)) {
+        snprintf(I.error, sizeof(I.error),
+                 "The package contains too many distinct decks.");
+        return false;
     }
-    top_level_name(raw, I.preview_name, sizeof(I.preview_name));
-    if (!I.preview_name[0])
-        snprintf(I.preview_name, sizeof(I.preview_name), "Imported Deck");
 
+    I.preview_models = I.col.model_count;
+    I.preview_media  = I.handle.media_entry_count;
     return true;
 }
 
-/* Process up to `n` cards in the running phase. Called each frame. */
-static bool run_chunk(App *a, int n) {
-    Deck *d = decklist_find(&a->data.decks, I.run_deck_id);
-    if (!d) {
-        snprintf(I.error, sizeof(I.error),
-                 "Internal error: deck disappeared during import.");
-        return false;
+/* Detect whether any deck in the plan already exists in the app. */
+static void detect_duplicates(const App *a) {
+    I.dup_any = false;
+    for (int i = 0; i < I.plan.deck_count; i++) {
+        if (import_find_existing_deck(&a->data.decks, I.plan.decks[i].name)) {
+            I.dup_any = true;
+            break;
+        }
+    }
+}
+
+/* ================================================================== */
+/*  Running                                                            */
+/* ================================================================== */
+
+static void run_begin(const App *a, ImportMode mode) {
+    I.mode = mode;
+    I.run_sub = RUN_MEDIA;
+    I.run_started = true;
+    decklist_init(&I.scratch);
+    memset(&I.media, 0, sizeof(I.media));
+    memset(&I.job, 0, sizeof(I.job));
+    (void)a;
+}
+
+static void run_step(App *a) {
+    if (I.run_sub == RUN_MEDIA) {
+        char mroot[512];
+        media_root(mroot, sizeof(mroot));
+        if (I.handle.media_json_path[0]) {
+            media_import_all(I.apkg_path, I.handle.media_json_path,
+                             mroot, NULL, NULL, &I.media);
+            import_warn_media(&I.job.warnings, &I.media);
+        }
+        import_job_init(&I.job, &I.col, &I.media, &I.scratch);
+        I.run_sub = RUN_CARDS;
+        return;
     }
 
-    int end = I.run_card_index + n;
-    if (end > I.col.card_count) end = I.col.card_count;
-
-    for (int i = I.run_card_index; i < end; i++) {
-        const AnkiCard *ac = &I.col.cards[i];
-        ConvertedCard cc;
-        if (!anki_convert_card(&I.col, ac, &cc)) {
-            TraceLog(LOG_WARNING, "ANKI: failed to convert card %d (nid=%" PRId64 ")", i, ac->nid);
-            continue;
+    if (I.run_sub == RUN_CARDS) {
+        if (!import_job_done(&I.job)) {
+            import_job_step(&I.job, 120);
+            return;
         }
-
-        Card *card;
-        if (cc.field_count > 0) {
-            card = deck_add_card_fields(d, cc.field_names,
-                                        (const char *const *)cc.field_values,
-                                        cc.field_count, "");
-        } else {
-            card = deck_add_card(d, "", "", "");
-        }
-        if (!card) {
-            anki_converted_card_free(&cc);
-            continue;
-        }
-
-        /* Tags live on the note, not the card. */
-        const AnkiNote *note = anki_find_note(&I.col, ac->nid);
-        if (note && note->tags[0]) {
-            char csv[MAX_TAGS];
-            anki_tags_to_csv(note->tags, csv, sizeof(csv));
-            if (csv[0]) snprintf(card->tags, MAX_TAGS, "%s", csv);
-        }
-
-        /* Preserve every discovered media reference and which side it
-           belongs to. Resolution to the normalized imported filename is
-           performed after the package media pass below. */
-        for (int m = 0; m < cc.media_ref_count; m++) {
-            card_add_media_ref(card, cc.media_refs[m],
-                               cc.media_kinds[m], cc.media_sides[m],
-                               cc.media_fields[m]);
-        }
-
-        TraceLog(LOG_DEBUG,
-                 "ANKI: card %d nid=%" PRId64 " fields=%d media=%d",
-                 i, ac->nid, cc.field_count, cc.media_ref_count);
-        anki_converted_card_free(&cc);
+        I.warnings = I.job.warnings;
+        I.result_cards = I.job.cards_added;
+        I.result_notes = I.job.notes_added;
+        I.run_sub = RUN_COMMIT;
+        return;
     }
 
-    I.run_card_index = end;
-    return true;
+    /* RUN_COMMIT */
+    import_commit(&a->data.decks, &I.scratch, I.mode, &I.warnings);
+
+    media_import_free(&I.media);
+    import_job_free(&I.job);
+
+    app_refresh_fonts(a);
+    app_save(a);
+
+    Player *p = &a->data.player;
+    if (!p->achievements[ACH_FIRST_CARD].unlocked && I.result_cards > 0) {
+        p->achievements[ACH_FIRST_CARD].unlocked = true;
+        p->achievements[ACH_FIRST_CARD].unlocked_at = (double)time(NULL);
+        p->coins += ACH_DEFS[ACH_FIRST_CARD].coin_reward;
+        player_add_xp(p, ACH_DEFS[ACH_FIRST_CARD].xp_reward);
+        snprintf(a->ach_popup, sizeof(a->ach_popup), "%s", ACH_DEFS[ACH_FIRST_CARD].name);
+        snprintf(a->ach_popup_desc, sizeof(a->ach_popup_desc), "%s", ACH_DEFS[ACH_FIRST_CARD].desc);
+        a->ach_popup_t = 3.f;
+    }
+    app_save(a);
+
+    I.phase = IMP_DONE;
+    I.phase_t = 0.f;
 }
 
 /* ================================================================== */
@@ -341,41 +310,74 @@ bool import_ui_update(App *a, float dt) {
 
     int W = GetScreenWidth(), H = GetScreenHeight();
 
-    /* ---- ENTER_PATH -------------------------------------------- */
-    if (I.phase == IMP_ENTER_PATH) {
-        int ch;
-        while ((ch = GetCharPressed()) > 0) {
-            size_t len = strlen(I.path_input);
-            if (len + 1 < sizeof(I.path_input) && ch >= 32) {
-                I.path_input[len]     = (char)ch;
-                I.path_input[len + 1] = 0;
-            }
-        }
-        if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
-            size_t len = strlen(I.path_input);
-            if (len > 0) I.path_input[len - 1] = 0;
-        }
+    /* ---- BROWSE ------------------------------------------------ */
+    if (I.phase == IMP_BROWSE) {
         if (IsKeyPressed(KEY_ESCAPE)) { close_modal(); return true; }
 
-        Rectangle btn_open   = { W/2.f - 280, H/2.f + 80, 180, 52 };
-        Rectangle btn_cancel = { W/2.f + 100, H/2.f + 80, 180, 52 };
+        int rows = 12;
 
-        bool do_open = IsKeyPressed(KEY_ENTER);
-        if (ui_button_hover(btn_open) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
-            do_open = true;
-        if (ui_button_hover(btn_cancel) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
-            close_modal();
+        if (IsKeyPressed(KEY_UP)) {
+            I.selected--;
+            if (I.selected < 0) I.selected = 0;
+            if (I.selected < I.scroll) I.scroll = I.selected;
+        }
+        if (IsKeyPressed(KEY_DOWN)) {
+            I.selected++;
+            if (I.selected >= I.entry_count) I.selected = I.entry_count - 1;
+            if (I.selected >= I.scroll + rows) I.scroll = I.selected - rows + 1;
+        }
+        if (I.scroll < 0) I.scroll = 0;
+        if (I.selected < 0 && I.entry_count > 0) I.selected = 0;
 
-        if (do_open) {
-            if (I.path_input[0] && open_and_parse()) {
-                I.phase = IMP_PREVIEW;
-                I.phase_t = 0.f;
-            } else {
-                if (!I.error[0])
-                    snprintf(I.error, sizeof(I.error), "No path entered.");
-                I.phase = IMP_ERROR;
-                I.phase_t = 0.f;
+        float list_y = H/2.f - 120;
+        float row_h = 26;
+        Rectangle list_rect = { W/2.f - 300, list_y, 600, rows * row_h };
+
+        /* Mouse selection on entries. */
+        for (int r = 0; r < rows; r++) {
+            int idx = I.scroll + r;
+            if (idx >= I.entry_count) break;
+            Rectangle row = { list_rect.x + 8, list_rect.y + r * row_h,
+                              list_rect.width - 16, row_h };
+            if (ui_button_hover(row) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                I.selected = idx;
+                if (I.entries[idx].is_apkg) {
+                    if (open_selected()) { I.phase = IMP_PREVIEW; I.phase_t = 0.f; }
+                    else { I.phase = IMP_ERROR; I.phase_t = 0.f; }
+                    return true;
+                }
+                char nd[600];
+                snprintf(nd, sizeof(nd), "%s/%s", I.browse_dir, I.entries[idx].name);
+                browse_scan(nd);
+                return true;
             }
+        }
+
+        bool do_open = false, do_up = false;
+        if (IsKeyPressed(KEY_ENTER)) {
+            if (I.selected >= 0 && I.selected < I.entry_count) {
+                if (I.entries[I.selected].is_apkg) do_open = true;
+                else {
+                    char nd[600];
+                    snprintf(nd, sizeof(nd), "%s/%s", I.browse_dir, I.entries[I.selected].name);
+                    browse_scan(nd);
+                    return true;
+                }
+            }
+        }
+
+        Rectangle btn_open   = { W/2.f - 280, H/2.f + 220, 180, 52 };
+        Rectangle btn_up     = { W/2.f - 90,  H/2.f + 220, 180, 52 };
+        Rectangle btn_cancel = { W/2.f + 100, H/2.f + 220, 180, 52 };
+
+        if (ui_button_hover(btn_open) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) do_open = true;
+        if (ui_button_hover(btn_up) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) do_up = true;
+        if (ui_button_hover(btn_cancel) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) { close_modal(); return true; }
+
+        if (do_up) { browse_up(); return true; }
+        if (do_open) {
+            if (open_selected()) { I.phase = IMP_PREVIEW; I.phase_t = 0.f; }
+            else { I.phase = IMP_ERROR; I.phase_t = 0.f; }
         }
         return true;
     }
@@ -384,12 +386,15 @@ bool import_ui_update(App *a, float dt) {
     if (I.phase == IMP_PREVIEW) {
         if (IsKeyPressed(KEY_ESCAPE)) { close_modal(); return true; }
 
-        Rectangle btn_import = { W/2.f - 280, H/2.f + 170, 180, 56 };
-        Rectangle btn_cancel = { W/2.f + 100, H/2.f + 170, 180, 56 };
+        Rectangle btn_import = { W/2.f - 280, H/2.f + 200, 180, 56 };
+        Rectangle btn_back   = { W/2.f - 90,  H/2.f + 200, 180, 56 };
+        Rectangle btn_cancel = { W/2.f + 100, H/2.f + 200, 180, 56 };
 
+        if (ui_button_hover(btn_back) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            I.phase = IMP_BROWSE; I.phase_t = 0.f; return true;
+        }
         if (ui_button_hover(btn_cancel) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            close_modal();
-            return true;
+            close_modal(); return true;
         }
 
         bool do_import = IsKeyPressed(KEY_ENTER);
@@ -397,145 +402,59 @@ bool import_ui_update(App *a, float dt) {
             do_import = true;
 
         if (do_import) {
-            /* Create the StudyQuest deck now, before the running phase. */
-            char final_name[MAX_DECK_NAME];
-            if (!unique_deck_name(a, I.preview_name, final_name, sizeof(final_name))) {
-                snprintf(I.error, sizeof(I.error), "Too many decks — delete some first.");
-                I.phase = IMP_ERROR;
-                I.phase_t = 0.f;
-                return true;
-            }
-            Color col = (Color){
-                (unsigned char)(100 + GetRandomValue(0, 100)),
-                (unsigned char)(120 + GetRandomValue(0, 100)),
-                (unsigned char)(180 + GetRandomValue(0, 60)),
-                255
-            };
-            Deck *d = decklist_add(&a->data.decks, final_name, col);
-            if (!d) {
-                snprintf(I.error, sizeof(I.error), "Could not create deck.");
-                I.phase = IMP_ERROR;
-                I.phase_t = 0.f;
-                return true;
-            }
-            I.run_deck_id     = d->id;
-            I.run_card_index  = 0;
-            I.run_started     = true;
-            I.result_deck_id  = d->id;
-            snprintf(I.result_deck_name, sizeof(I.result_deck_name), "%s", final_name);
-            I.phase = IMP_RUNNING;
-            I.phase_t = 0.f;
+            detect_duplicates(a);
+            if (I.dup_any) { I.phase = IMP_DUP; I.phase_t = 0.f; return true; }
+            run_begin(a, IMPORT_MODE_NEW);
+            I.phase = IMP_RUNNING; I.phase_t = 0.f;
+        }
+        return true;
+    }
+
+    /* ---- DUP (duplicate handling) ------------------------------ */
+    if (I.phase == IMP_DUP) {
+        if (IsKeyPressed(KEY_ESCAPE)) { I.phase = IMP_PREVIEW; I.phase_t = 0.f; return true; }
+
+        Rectangle btn_new    = { W/2.f - 300, H/2.f + 140, 180, 56 };
+        Rectangle btn_update = { W/2.f - 100, H/2.f + 140, 180, 56 };
+        Rectangle btn_cancel = { W/2.f + 100, H/2.f + 140, 180, 56 };
+
+        if (ui_button_hover(btn_new) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            run_begin(a, IMPORT_MODE_NEW);
+            I.phase = IMP_RUNNING; I.phase_t = 0.f; return true;
+        }
+        if (ui_button_hover(btn_update) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            run_begin(a, IMPORT_MODE_UPDATE);
+            I.phase = IMP_RUNNING; I.phase_t = 0.f; return true;
+        }
+        if (ui_button_hover(btn_cancel) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            I.phase = IMP_PREVIEW; I.phase_t = 0.f; return true;
         }
         return true;
     }
 
     /* ---- RUNNING ----------------------------------------------- */
     if (I.phase == IMP_RUNNING) {
-        /* ~120 cards per frame keeps the loop responsive. */
-        if (!run_chunk(a, 120)) {
-            I.phase = IMP_ERROR;
-            I.phase_t = 0.f;
-            return true;
-        }
-
-        if (I.run_card_index >= I.col.card_count) {
-            Deck *imported_deck = decklist_find(&a->data.decks, I.run_deck_id);
-            if (!imported_deck) {
-                snprintf(I.error, sizeof(I.error), "Imported deck disappeared before media resolution.");
-                I.phase = IMP_ERROR;
-                I.phase_t = 0.f;
-                return true;
-            }
-
-            /* Media pass. Synchronous but bounded by file count. */
-            if (I.handle.media_json_path[0]) {
-                char mroot[512];
-                media_root(mroot, sizeof(mroot));
-
-                MediaImportResult mr = {0};
-                char real_path[512];
-                expand_tilde(I.path_input, sizeof(I.path_input), real_path, sizeof(real_path));
-                if (!media_import_all(real_path,
-                                      I.handle.media_json_path,
-                                      mroot, NULL, NULL, &mr)) {
-                    TraceLog(LOG_WARNING, "Media import failed: %s", mr.error);
-                } else {
-                    TraceLog(LOG_INFO,
-                        "Media: copied=%d missing=%d unsafe=%d entries=%d",
-                        mr.copied, mr.missing, mr.skipped_unsafe, mr.count);
-
-                    /* Convert source names such as an Anki media-map value
-                       to the exact normalized filename written on disk. */
-                    for (int di = 0; di < imported_deck->card_count; di++) {
-                        Card *card = &imported_deck->cards[di];
-                        for (int mi = 0; mi < card->media_ref_count; mi++) {
-                            char resolved[sizeof(card->media_refs[mi].ref)];
-                            if (media_import_resolve(&mr, card->media_refs[mi].ref,
-                                                     resolved, sizeof(resolved))) {
-                                snprintf(card->media_refs[mi].ref,
-                                         sizeof(card->media_refs[mi].ref), "%s", resolved);
-                            }
-                        }
-
-                        /* Rebuild the legacy first-image/first-audio aliases
-                           from the complete resolved list. */
-                        card->image_ref[0] = 0;
-                        card->audio_ref[0] = 0;
-                        for (int mi = 0; mi < card->media_ref_count; mi++) {
-                            if (card->media_refs[mi].kind == MEDIA_KIND_IMAGE && !card->image_ref[0])
-                                snprintf(card->image_ref, sizeof(card->image_ref), "%s",
-                                         card->media_refs[mi].ref);
-                            if (card->media_refs[mi].kind == MEDIA_KIND_AUDIO && !card->audio_ref[0])
-                                snprintf(card->audio_ref, sizeof(card->audio_ref), "%s",
-                                         card->media_refs[mi].ref);
-                        }
-                    }
-                }
-                media_import_free(&mr);
-            }
-
-            I.result_cards = I.run_card_index;
-            app_refresh_fonts(a);
-            app_save(a);
-
-            /* Achievement: FIRST_CARD fires when the user creates their
-               first card; here we fire it for the whole import event so
-               a first-import user gets the reward. */
-            Player *p = &a->data.player;
-            if (!p->achievements[ACH_FIRST_CARD].unlocked) {
-                p->achievements[ACH_FIRST_CARD].unlocked = true;
-                p->achievements[ACH_FIRST_CARD].unlocked_at = (double)time(NULL);
-                p->coins += ACH_DEFS[ACH_FIRST_CARD].coin_reward;
-                player_add_xp(p, ACH_DEFS[ACH_FIRST_CARD].xp_reward);
-                snprintf(a->ach_popup, sizeof(a->ach_popup), "%s",
-                         ACH_DEFS[ACH_FIRST_CARD].name);
-                snprintf(a->ach_popup_desc, sizeof(a->ach_popup_desc), "%s",
-                         ACH_DEFS[ACH_FIRST_CARD].desc);
-                a->ach_popup_t = 3.f;
-            }
-            app_save(a);
-
-            I.phase = IMP_DONE;
-            I.phase_t = 0.f;
-        }
+        run_step(a);
         return true;
     }
 
     /* ---- DONE -------------------------------------------------- */
     if (I.phase == IMP_DONE) {
-        Rectangle btn_study = { W/2.f - 280, H/2.f + 170, 240, 56 };
-        Rectangle btn_close = { W/2.f + 40,  H/2.f + 170, 240, 56 };
+        Rectangle btn_study = { W/2.f - 300, H/2.f + 190, 220, 56 };
+        Rectangle btn_close = { W/2.f - 70,  H/2.f + 190, 260, 56 };
 
         if (IsKeyPressed(KEY_ESCAPE)) { close_modal(); return true; }
-
         if (ui_button_hover(btn_close) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            close_modal();
-            return true;
+            close_modal(); return true;
         }
         if (ui_button_hover(btn_study) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            int deck_id = I.result_deck_id;
+            int deck_id = -1;
+            if (I.plan.deck_count > 0) {
+                Deck *d = import_find_existing_deck(&a->data.decks, I.plan.decks[0].name);
+                if (d) deck_id = d->id;
+            }
             close_modal();
-            app_start_session(a, deck_id);
+            if (deck_id >= 0) app_start_session(a, deck_id);
             return true;
         }
         return true;
@@ -544,7 +463,6 @@ bool import_ui_update(App *a, float dt) {
     /* ---- ERROR ------------------------------------------------- */
     if (I.phase == IMP_ERROR) {
         if (IsKeyPressed(KEY_ESCAPE)) { close_modal(); return true; }
-
         Rectangle btn_ok = { W/2.f - 90, H/2.f + 140, 180, 52 };
         if (ui_button_hover(btn_ok) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
             close_modal();
@@ -565,128 +483,180 @@ static void dim_background(int W, int H) {
 
 static void panel_header(Rectangle m, const char *title) {
     ui_panel_border(m, TH.panel, TH.border_hi, RADIUS_LG, 2.f);
-    ui_text_center(title,
-        (Rectangle){ m.x, m.y + 22, m.width, 34 }, FONT_MD, TH.text);
+    ui_text_center(title, (Rectangle){ m.x, m.y + 22, m.width, 34 }, FONT_MD, TH.text);
 }
 
-static void draw_enter_path(int W, int H) {
+static void draw_browse(int W, int H) {
     dim_background(W, H);
-    Rectangle m = { W/2.f - 320, H/2.f - 140, 640, 320 };
+    Rectangle m = { W/2.f - 340, H/2.f - 200, 680, 480 };
     panel_header(m, "Import Anki Deck");
 
-    ui_text_center("Paste the path to a .apkg file.",
-        (Rectangle){ m.x, m.y + 70, m.width, 22 },
-        FONT_SM, TH.text_dim);
-    ui_text_center("Example: ~/Downloads/Japanese Core 2k.apkg",
-        (Rectangle){ m.x, m.y + 92, m.width, 22 },
-        FONT_XS, TH.text_muted);
+    ui_text_center("Select a .apkg file",
+        (Rectangle){ m.x, m.y + 60, m.width, 22 }, FONT_SM, TH.text_dim);
 
-    Rectangle inp = { m.x + 40, m.y + 130, m.width - 80, 48 };
-    ui_panel_border(inp, TH.bg2, TH.primary, RADIUS_MD, 1.5f);
-    ui_text(I.path_input[0] ? I.path_input : "(empty)",
-            (int)inp.x + 12, (int)inp.y + 14, FONT_SM,
-            I.path_input[0] ? TH.text : TH.text_muted);
+    ui_text(I.browse_dir, (int)m.x + 40, (int)m.y + 92, FONT_XS, TH.text_muted);
 
-    if (((int)(GetTime() * 2.0f)) % 2 == 0) {
-        int cx = (int)inp.x + 12 + ui_measure(I.path_input, FONT_SM) + 2;
-        DrawRectangle(cx, (int)inp.y + 12, 2, 24, TH.primary);
+    int rows = 12;
+    float list_y = m.y + 120;
+    float row_h = 26;
+    Rectangle list_rect = { m.x + 40, list_y, m.width - 80, rows * row_h };
+    ui_panel_border(list_rect, TH.bg2, TH.border, RADIUS_MD, 1.f);
+
+    for (int r = 0; r < rows; r++) {
+        int idx = I.scroll + r;
+        if (idx >= I.entry_count) break;
+        BrowseEntry *be = &I.entries[idx];
+        Rectangle row = { list_rect.x + 6, list_rect.y + r * row_h,
+                          list_rect.width - 12, row_h - 2 };
+        if (idx == I.selected) ui_panel(row, TH.primary_lo, RADIUS_SM);
+
+        char label[280];
+        snprintf(label, sizeof(label), "%s%s", be->is_dir ? "DIR  " : "      ", be->name);
+        Color c = be->is_dir ? TH.text_dim : TH.text;
+        ui_text(label, (int)row.x + 10, (int)row.y + 5, FONT_SM, c);
     }
 
-    Rectangle btn_open   = { W/2.f - 280, H/2.f + 80, 180, 52 };
-    Rectangle btn_cancel = { W/2.f + 100, H/2.f + 80, 180, 52 };
-    if (ui_button(btn_open,   "OPEN",   TH.primary, TH.text)) { /* handled */ }
-    if (ui_button(btn_cancel, "CANCEL", TH.panel_hi, TH.text)) { /* handled */ }
+    ui_text_center("Up/Down to move   Enter to open   Esc to cancel",
+        (Rectangle){ m.x, m.y + m.height - 120, m.width, 20 }, FONT_XS, TH.text_muted);
 
-    ui_text_center("Enter to open   •   Esc to cancel",
-        (Rectangle){ m.x, m.y + m.height - 34, m.width, 22 },
-        FONT_XS, TH.text_muted);
+    Rectangle btn_open   = { W/2.f - 280, H/2.f + 220, 180, 52 };
+    Rectangle btn_up     = { W/2.f - 90,  H/2.f + 220, 180, 52 };
+    Rectangle btn_cancel = { W/2.f + 100, H/2.f + 220, 180, 52 };
+    ui_button(btn_open, "OPEN", TH.primary, TH.text);
+    ui_button(btn_up, "UP", TH.panel_hi, TH.text);
+    ui_button(btn_cancel, "CANCEL", TH.panel_hi, TH.text);
 }
 
 static void draw_preview(int W, int H) {
     dim_background(W, H);
-    Rectangle m = { W/2.f - 360, H/2.f - 220, 720, 500 };
+    Rectangle m = { W/2.f - 360, H/2.f - 240, 720, 540 };
     panel_header(m, "Import Preview");
 
-    /* Deck name */
-    ui_text_center(I.preview_name,
-        (Rectangle){ m.x, m.y + 62, m.width, 34 },
-        FONT_LG, TH.text);
+    float y = m.y + 66;
+    char buf[64];
 
-    /* Stats rows */
-    float y = m.y + 110;
-    char buf[128];
-    struct { const char *label; int n; } rows[] = {
-        { "Cards",      I.preview_cards },
-        { "Notes",      I.preview_notes },
+    struct { const char *label; int n; } head[] = {
+        { "Cards",      I.col.card_count },
+        { "Notes",      I.col.note_count },
         { "Note types", I.preview_models },
         { "Media files", I.preview_media },
     };
-    for (size_t i = 0; i < sizeof(rows)/sizeof(rows[0]); i++) {
-        snprintf(buf, sizeof(buf), "%d", rows[i].n);
-        ui_text(rows[i].label, (int)m.x + 60, (int)y, FONT_SM, TH.text_dim);
+    for (size_t i = 0; i < sizeof(head)/sizeof(head[0]); i++) {
+        snprintf(buf, sizeof(buf), "%d", head[i].n);
+        ui_text(head[i].label, (int)m.x + 60, (int)y, FONT_SM, TH.text_dim);
         int nw = ui_measure(buf, FONT_MD);
         ui_text(buf, (int)(m.x + m.width - 60 - nw), (int)y - 4, FONT_MD, TH.text);
-        y += 36;
+        y += 30;
     }
 
-    /* Note about scheduling */
-    ui_text_center("All imported cards will be treated as new.",
-        (Rectangle){ m.x, (float)(m.y + m.height - 130), m.width, 22 },
-        FONT_XS, TH.text_muted);
-    ui_text_center("StudyQuest's scheduler takes over from here.",
-        (Rectangle){ m.x, (float)(m.y + m.height - 108), m.width, 22 },
-        FONT_XS, TH.text_muted);
+    y += 10;
+    ui_text("Decks", (int)m.x + 60, (int)y, FONT_SM, TH.text_dim);
+    y += 26;
 
-    Rectangle btn_import = { W/2.f - 280, H/2.f + 170, 180, 56 };
-    Rectangle btn_cancel = { W/2.f + 100, H/2.f + 170, 180, 56 };
+    for (int i = 0; i < I.plan.deck_count && y < m.y + m.height - 90; i++) {
+        ImportDeckSummary *s = &I.plan.decks[i];
+        ui_text(s->name, (int)m.x + 72, (int)y, FONT_SM, TH.text);
+        snprintf(buf, sizeof(buf), "%d cards", s->card_count);
+        int nw = ui_measure(buf, FONT_XS);
+        ui_text(buf, (int)(m.x + m.width - 72 - nw), (int)y + 4, FONT_XS, TH.text_muted);
+        y += 24;
+    }
+
+    ui_text_center("All cards are studyable immediately. Review maturity is preserved,",
+        (Rectangle){ m.x, m.y + m.height - 66, m.width, 18 }, FONT_XS, TH.text_muted);
+    ui_text_center("and StudyQuest's scheduler takes over from here.",
+        (Rectangle){ m.x, m.y + m.height - 48, m.width, 18 }, FONT_XS, TH.text_muted);
+
+    Rectangle btn_import = { W/2.f - 280, H/2.f + 200, 180, 56 };
+    Rectangle btn_back   = { W/2.f - 90,  H/2.f + 200, 180, 56 };
+    Rectangle btn_cancel = { W/2.f + 100, H/2.f + 200, 180, 56 };
     ui_button(btn_import, "IMPORT", TH.primary, TH.text);
+    ui_button(btn_back, "BACK", TH.panel_hi, TH.text);
+    ui_button(btn_cancel, "CANCEL", TH.panel_hi, TH.text);
+}
+
+static void draw_dup(int W, int H) {
+    dim_background(W, H);
+    Rectangle m = { W/2.f - 320, H/2.f - 170, 640, 360 };
+    panel_header(m, "Existing Deck Found");
+
+    ui_text_center("A deck with this name already exists.",
+        (Rectangle){ m.x, m.y + 66, m.width, 24 }, FONT_SM, TH.text);
+    ui_text_center("Choose how to import:",
+        (Rectangle){ m.x, m.y + 96, m.width, 24 }, FONT_SM, TH.text_dim);
+
+    ui_text_center("Import as New — creates a separate deck (adds a suffix).",
+        (Rectangle){ m.x, m.y + 140, m.width, 20 }, FONT_XS, TH.text_muted);
+    ui_text_center("Update Existing — adds only cards not already present.",
+        (Rectangle){ m.x, m.y + 162, m.width, 20 }, FONT_XS, TH.text_muted);
+
+    Rectangle btn_new    = { W/2.f - 300, H/2.f + 140, 180, 56 };
+    Rectangle btn_update = { W/2.f - 100, H/2.f + 140, 180, 56 };
+    Rectangle btn_cancel = { W/2.f + 100, H/2.f + 140, 180, 56 };
+    ui_button(btn_new, "IMPORT AS NEW", TH.primary, TH.text);
+    ui_button(btn_update, "UPDATE", TH.panel_hi, TH.text);
     ui_button(btn_cancel, "CANCEL", TH.panel_hi, TH.text);
 }
 
 static void draw_running(int W, int H) {
     dim_background(W, H);
-    Rectangle m = { W/2.f - 300, H/2.f - 90, 600, 200 };
+    Rectangle m = { W/2.f - 300, H/2.f - 100, 600, 220 };
     panel_header(m, "Importing...");
 
-    float pct = I.col.card_count > 0
-        ? (float)I.run_card_index / (float)I.col.card_count
-        : 0.f;
+    const char *label = "Reading package...";
+    float pct = 0.f;
+    char sub[96] = "";
 
-    Rectangle bar = { m.x + 40, m.y + 100, m.width - 80, 24 };
+    if (I.run_sub == RUN_MEDIA) {
+        label = "Importing media...";
+        pct = 0.f;
+    } else if (I.run_sub == RUN_CARDS) {
+        label = "Importing cards...";
+        if (I.col.card_count > 0)
+            pct = (float)I.job.next_card / (float)I.col.card_count;
+        snprintf(sub, sizeof(sub), "%d / %d cards", I.job.next_card, I.col.card_count);
+    } else {
+        label = "Finishing up...";
+        pct = 1.f;
+    }
+
+    ui_text_center(label, (Rectangle){ m.x, m.y + 62, m.width, 24 }, FONT_SM, TH.text_dim);
+
+    Rectangle bar = { m.x + 40, m.y + 104, m.width - 80, 24 };
     ui_progress(bar, pct, TH.primary, TH.bg, RADIUS_MD);
-
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%d / %d cards", I.run_card_index, I.col.card_count);
-    ui_text_center(buf, bar, FONT_SM, TH.text);
+    if (sub[0]) ui_text_center(sub, bar, FONT_SM, TH.text);
 
     ui_text_center("Please wait — do not close the window.",
-        (Rectangle){ m.x, m.y + 148, m.width, 22 },
-        FONT_XS, TH.text_muted);
+        (Rectangle){ m.x, m.y + 150, m.width, 22 }, FONT_XS, TH.text_muted);
 }
 
 static void draw_done(int W, int H) {
     dim_background(W, H);
-    Rectangle m = { W/2.f - 320, H/2.f - 180, 640, 400 };
+    bool has_warnings = I.warnings.count > 0;
+    Rectangle m = { W/2.f - 340, H/2.f - 200, 680, has_warnings ? 470 : 420 };
     panel_header(m, "Import Complete");
 
-    /* Big count */
     char buf[64];
     snprintf(buf, sizeof(buf), "%d", I.result_cards);
-    ui_text_center(buf,
-        (Rectangle){ m.x, m.y + 80, m.width, 90 },
-        FONT_XL, TH.success);
+    ui_text_center(buf, (Rectangle){ m.x, m.y + 70, m.width, 80 }, FONT_XL, TH.success);
     ui_text_center("cards imported",
-        (Rectangle){ m.x, m.y + 172, m.width, 24 },
-        FONT_SM, TH.text_dim);
+        (Rectangle){ m.x, m.y + 150, m.width, 22 }, FONT_SM, TH.text_dim);
 
-    ui_text_center(I.result_deck_name,
-        (Rectangle){ m.x, m.y + 212, m.width, 34 },
-        FONT_MD, TH.text);
+    snprintf(buf, sizeof(buf), "%d notes • %d decks", I.result_notes, I.plan.deck_count);
+    ui_text_center(buf, (Rectangle){ m.x, m.y + 180, m.width, 24 }, FONT_SM, TH.text_dim);
 
-    Rectangle btn_study = { W/2.f - 280, H/2.f + 170, 240, 56 };
-    Rectangle btn_close = { W/2.f + 40,  H/2.f + 170, 240, 56 };
+    if (has_warnings) {
+        ui_text_center("Warnings",
+            (Rectangle){ m.x, m.y + 216, m.width, 22 }, FONT_XS, TH.warning);
+        ui_text_wrapped(I.warnings.message,
+            (Rectangle){ m.x + 40, m.y + 240, m.width - 80, 120 },
+            FONT_XS, TH.text_muted, 2);
+    }
+
+    Rectangle btn_study = { W/2.f - 300, H/2.f + (has_warnings ? 250 : 190), 220, 56 };
+    Rectangle btn_close = { W/2.f - 70,  H/2.f + (has_warnings ? 250 : 190), 260, 56 };
     ui_button(btn_study, "START STUDYING", TH.primary, TH.text);
-    ui_button(btn_close, "BACK TO DECKS",  TH.panel_hi, TH.text);
+    ui_button(btn_close, "BACK TO DECKS", TH.panel_hi, TH.text);
 }
 
 static void draw_error(int W, int H) {
@@ -699,8 +669,7 @@ static void draw_error(int W, int H) {
         FONT_SM, TH.danger, 4);
 
     ui_text_center("No changes were made to your existing decks.",
-        (Rectangle){ m.x, m.y + 230, m.width, 22 },
-        FONT_XS, TH.text_muted);
+        (Rectangle){ m.x, m.y + 230, m.width, 22 }, FONT_XS, TH.text_muted);
 
     Rectangle btn_ok = { W/2.f - 90, H/2.f + 140, 180, 52 };
     ui_button(btn_ok, "OK", TH.panel_hi, TH.text);
@@ -711,11 +680,27 @@ void import_ui_draw(App *a) {
     if (I.phase == IMP_IDLE) return;
     int W = GetScreenWidth(), H = GetScreenHeight();
     switch (I.phase) {
-        case IMP_ENTER_PATH: draw_enter_path(W, H); break;
-        case IMP_PREVIEW:    draw_preview(W, H);    break;
-        case IMP_RUNNING:    draw_running(W, H);    break;
-        case IMP_DONE:       draw_done(W, H);       break;
-        case IMP_ERROR:      draw_error(W, H);      break;
+        case IMP_BROWSE:  draw_browse(W, H);  break;
+        case IMP_PREVIEW: draw_preview(W, H); break;
+        case IMP_DUP:     draw_dup(W, H);     break;
+        case IMP_RUNNING: draw_running(W, H); break;
+        case IMP_DONE:    draw_done(W, H);    break;
+        case IMP_ERROR:   draw_error(W, H);   break;
         default: break;
     }
+}
+
+/* ================================================================== */
+/*  Entry                                                              */
+/* ================================================================== */
+
+void import_ui_start(App *a) {
+    (void)a;
+    reset_state();
+    I.phase = IMP_BROWSE;
+    I.phase_t = 0.f;
+
+    const char *home = getenv("HOME");
+    if (!home || !*home) home = ".";
+    browse_scan(home);
 }

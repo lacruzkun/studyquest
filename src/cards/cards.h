@@ -5,8 +5,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define MAX_DECKS       24
-#define MAX_CARDS       128
+#define MAX_DECKS       256
+/* Hard sanity cap per deck (loads/imports). Decks hold a heap-grown card
+   array, so this is only a guard against absurd/malicious input. */
+#define MAX_CARDS       200000
 #define MAX_TEXT        320
 #define MAX_TAGS        96
 #define MAX_DECK_NAME   64
@@ -29,6 +31,10 @@ typedef enum {
 
 typedef struct Card {
     int  id;
+
+    /* Stable identity of the source Anki card, used for duplicate
+       detection on re-import. 0 means "not imported from Anki". */
+    int64_t anki_card_id;
 
     /* Legacy / simple cards (CSV, manual editor). */
     char front[MAX_TEXT];
@@ -67,8 +73,9 @@ typedef struct Deck {
     int id;
     char name[MAX_DECK_NAME];
     Color color;
-    Card cards[MAX_CARDS];
-    int card_count;
+    Card *cards;          /* heap-grown; capacity in card_capacity */
+    int  card_count;
+    int  card_capacity;
 } Deck;
 
 typedef struct DeckList {
@@ -80,6 +87,9 @@ typedef struct DeckList {
 void decklist_init(DeckList *dl);
 void decklist_free(DeckList *dl);
 void decklist_init_sample(DeckList *dl);
+
+/* Free a deck's cards (and heap card array). The deck struct is left empty. */
+void deck_free(Deck *d);
 
 Deck *decklist_find(DeckList *dl, int id);
 Deck *decklist_add(DeckList *dl, const char *name, Color color);
@@ -99,6 +109,17 @@ void  deck_remove_card(Deck *d, int idx);
 void  card_free(Card *c);
 int   deck_due_count(const Deck *d, double now);
 float deck_retention(const Deck *d);
+
+/* Append a card by moving ownership of `src` (its heap field values) into
+   `d`. Returns NULL if the deck is full. `src` is zeroed on success. */
+Card *deck_add_card_move(Deck *d, Card *src);
+
+/* True if any card in `d` carries the given Anki card id (id != 0). */
+bool  deck_has_anki_card(const Deck *d, int64_t id);
+
+/* Append `src` (by moving ownership) into `dl`, reassigning a fresh deck
+   id. Returns NULL if the deck list is full. `src` is zeroed on success. */
+Deck *decklist_append_deck(DeckList *dl, Deck *src);
 
 /* Field helpers — safe with NULL and out-of-range indexes. */
 void        card_add_field(Card *c, const char *name, const char *value);

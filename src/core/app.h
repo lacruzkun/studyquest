@@ -21,7 +21,8 @@ typedef enum {
 
 typedef struct StudySession {
     int  deck_id;
-    int  queue[MAX_CARDS];
+    int *queue;
+    int  queue_cap;
     int  queue_len;
     int  current;
     bool revealed;

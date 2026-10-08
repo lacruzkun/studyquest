@@ -167,6 +167,39 @@ static void test_deck_sample(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Large decks (heap-grown card array, no 128-card cap)              */
+/* ------------------------------------------------------------------ */
+
+static void test_deck_large(void) {
+    static DeckList dl;
+    decklist_init(&dl);
+    Deck *d = decklist_add(&dl, "Big Deck", (Color){ 1, 2, 3, 255 });
+    CHECK(d != NULL);
+
+    /* Exceed the old fixed MAX_CARDS=128 limit by a wide margin. */
+    int target = 5000;
+    for (int i = 0; i < target; i++) {
+        char front[64], back[64];
+        snprintf(front, sizeof(front), "card %d", i);
+        snprintf(back,  sizeof(back),  "answer %d", i);
+        Card *c = deck_add_card(d, front, back, "");
+        CHECK(c != NULL);
+    }
+    CHECK(d->card_count == target);
+    CHECK(d->card_capacity >= target);
+    CHECK(strcmp(d->cards[0].front, "card 0") == 0);
+    CHECK(strcmp(d->cards[target - 1].front, "card 4999") == 0);
+
+    /* Removal must still compact and renumber correctly. */
+    deck_remove_card(d, 0);
+    CHECK(d->card_count == target - 1);
+    CHECK(d->cards[0].id == 1);
+    CHECK(strcmp(d->cards[0].front, "card 1") == 0);
+
+    decklist_free(&dl);
+}
+
+/* ------------------------------------------------------------------ */
 /*  Streak                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -218,6 +251,9 @@ int main(void) {
 
     printf("== sample deck ==\n");
     test_deck_sample();
+
+    printf("== large deck ==\n");
+    test_deck_large();
 
     printf("== streak ==\n");
     test_streak();

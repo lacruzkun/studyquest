@@ -9,7 +9,7 @@ let
   ];
 in
 pkgs.mkShell {
-  nativeBuildInputs = with pkgs; [ cmake gnumake gcc pkg-config ];
+  nativeBuildInputs = with pkgs; [ cmake gnumake gcc pkg-config opencode ];
 
   # NOTE: noto-fonts-cjk-sans provides .ttc files raylib can read.
     buildInputs = (with pkgs; [ raylib noto-fonts-cjk-sans zstd libwebp ]) ++ raylib_deps;

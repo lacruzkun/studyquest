@@ -41,10 +41,13 @@ static void card_move(Card *dst, Card *src) {
     memset(src, 0, sizeof(*src));
 }
 
-static void deck_free(Deck *d) {
+void deck_free(Deck *d) {
     if (!d) return;
     for (int i = 0; i < d->card_count; i++) card_free(&d->cards[i]);
+    free(d->cards);
+    d->cards = NULL;
     d->card_count = 0;
+    d->card_capacity = 0;
 }
 
 static void deck_move(Deck *dst, Deck *src) {
@@ -94,8 +97,26 @@ void decklist_remove(DeckList *dl, int idx) {
 /*  Card creation                                                     */
 /* ------------------------------------------------------------------ */
 
+/* Grow the deck's card array to hold at least `need` cards. */
+static bool deck_reserve(Deck *d, int need) {
+    if (need <= d->card_capacity) return true;
+    int cap = d->card_capacity > 0 ? d->card_capacity : 8;
+    while (cap < need) {
+        if (cap > MAX_CARDS / 2) { cap = need; break; }
+        cap *= 2;
+    }
+    if (cap > MAX_CARDS) cap = MAX_CARDS;
+    if (need > cap) return false;
+    Card *nc = (Card *)realloc(d->cards, sizeof(Card) * (size_t)cap);
+    if (!nc) return false;
+    d->cards = nc;
+    d->card_capacity = cap;
+    return true;
+}
+
 Card *deck_add_card(Deck *d, const char *front, const char *back, const char *tags) {
     if (d->card_count >= MAX_CARDS) return NULL;
+    if (!deck_reserve(d, d->card_count + 1)) return NULL;
     Card *c = &d->cards[d->card_count];
     memset(c, 0, sizeof(*c));
     c->id = d->card_count + 1;
@@ -143,6 +164,36 @@ void deck_remove_card(Deck *d, int idx) {
     memset(&d->cards[d->card_count - 1], 0, sizeof(d->cards[d->card_count - 1]));
     d->card_count--;
     for (int i = 0; i < d->card_count; i++) d->cards[i].id = i + 1;
+}
+
+Card *deck_add_card_move(Deck *d, Card *src) {
+    if (!d || !src) return NULL;
+    if (d->card_count >= MAX_CARDS) return NULL;
+    if (!deck_reserve(d, d->card_count + 1)) return NULL;
+    Card *dst = &d->cards[d->card_count];
+    *dst = *src;                 /* transfers heap field_values ownership */
+    memset(src, 0, sizeof(*src));
+    dst->id = d->card_count + 1;
+    d->card_count++;
+    return dst;
+}
+
+bool deck_has_anki_card(const Deck *d, int64_t id) {
+    if (!d || id == 0) return false;
+    for (int i = 0; i < d->card_count; i++)
+        if (d->cards[i].anki_card_id == id) return true;
+    return false;
+}
+
+Deck *decklist_append_deck(DeckList *dl, Deck *src) {
+    if (!dl || !src) return NULL;
+    if (dl->count >= MAX_DECKS) return NULL;
+    Deck *dst = &dl->decks[dl->count++];
+    memset(dst, 0, sizeof(*dst));
+    *dst = *src;                 /* moves the heap card array */
+    memset(src, 0, sizeof(*src));
+    dst->id = dl->next_id++;
+    return dst;
 }
 
 /* ------------------------------------------------------------------ */

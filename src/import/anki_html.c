@@ -199,8 +199,7 @@ void anki_html_process(const char *in, char *out, size_t cap,
             const char *close = strchr(p, '>');
             if (close) {
                 const char *name = p + 1;
-                bool closing = false;
-                if (*name == '/') { closing = true; name++; }
+                if (*name == '/') name++;   /* skip closing slash */
                 while (*name && isspace((unsigned char)*name)) name++;
                 char tname[16];
                 size_t nlen = 0;
@@ -212,14 +211,22 @@ void anki_html_process(const char *in, char *out, size_t cap,
                 }
                 tname[nlen] = 0;
 
-                bool is_break =
+                /* Block-level tags become line breaks so paragraphs, list
+                   items, and table rows read as separate lines. Both the
+                   opening and closing forms break (EMIT_NL suppresses
+                   consecutive newlines). */
+                bool is_block =
                     (strcmp(tname, "br") == 0) ||
-                    (closing && (strcmp(tname, "p") == 0 || strcmp(tname, "div") == 0 ||
-                                 strcmp(tname, "li") == 0 || strcmp(tname, "tr") == 0 ||
-                                 strcmp(tname, "h1") == 0 || strcmp(tname, "h2") == 0 ||
-                                 strcmp(tname, "h3") == 0 || strcmp(tname, "h4") == 0 ||
-                                 strcmp(tname, "h5") == 0 || strcmp(tname, "h6") == 0));
-                if (is_break) EMIT_NL();
+                    (strcmp(tname, "hr") == 0) ||
+                    (strcmp(tname, "p") == 0 || strcmp(tname, "div") == 0 ||
+                     strcmp(tname, "li") == 0 || strcmp(tname, "tr") == 0 ||
+                     strcmp(tname, "ul") == 0 || strcmp(tname, "ol") == 0 ||
+                     strcmp(tname, "table") == 0 ||
+                     strcmp(tname, "blockquote") == 0 ||
+                     strcmp(tname, "h1") == 0 || strcmp(tname, "h2") == 0 ||
+                     strcmp(tname, "h3") == 0 || strcmp(tname, "h4") == 0 ||
+                     strcmp(tname, "h5") == 0 || strcmp(tname, "h6") == 0);
+                if (is_block) EMIT_NL();
                 p = close + 1;
                 continue;
             }
