@@ -71,6 +71,11 @@ typedef struct {
     char *dconf_json;
     char *conf_json;
     int   schema_version;
+    int64_t crt;                 /* collection creation time (epoch secs); review
+                                    due days are counted from here */
+    void *note_keys;             /* sorted (id, index) pairs for O(log n) note lookup;
+                                    built by anki_parse, optional for hand-built collections */
+    bool  modern_schema;         /* models/decks came from schema-18 tables */
 
     char error[512];
 } AnkiCollection;

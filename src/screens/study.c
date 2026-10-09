@@ -40,6 +40,10 @@ typedef struct StudyUI {
     /* Mouse tilt */
     float tilt_x, tilt_y;
 
+    /* Vertical scroll inside a card taller than the window. */
+    float scroll_y;
+    float scroll_max;
+
     /* Reveal stagger — one value per field, plus the divider. */
     float rev_field[MAX_FIELDS];
     float rev_divider;
@@ -174,6 +178,7 @@ static void set_phase(App *a, StudyPhase p) {
     S.phase_t = 0.f;
 
     if (p == PHASE_ENTER) {
+        S.scroll_y = 0.f;
         S.audio_ref_index = 0;
         S.enter_x = 520.f;
         S.enter_alpha = 0.f;
@@ -182,6 +187,7 @@ static void set_phase(App *a, StudyPhase p) {
         S.exit_rot = 0.f;
         S.exit_alpha = 1.f;
     } else if (p == PHASE_REVEAL) {
+        S.scroll_y = 0.f;
         S.audio_ref_index = 0;
         for (int i = 0; i < MAX_FIELDS; i++) S.rev_field[i] = 0.f;
         S.rev_divider = 0.f;
@@ -440,19 +446,21 @@ void study_update(App *a, float dt) {
 /*  Draw helpers                                                       */
 /* ------------------------------------------------------------------ */
 
-static int card_image_count_for_side(const Card *c, int side) {
-    if (!c) return 0;
-    int n = 0;
-    for (int i = 0; i < c->media_ref_count; i++) {
-        if (c->media_refs[i].kind != 0) continue;
-        if (c->media_refs[i].side != (unsigned char)(side ? 1 : 0)) continue;
-        n++;
-    }
-    return n;
+static bool field_has_images(const Card *c, int side, int field_index) {
+    unsigned char f = (unsigned char)(field_index < 0 ? 255 : field_index);
+    for (int i = 0; i < c->media_ref_count; i++)
+        if (c->media_refs[i].kind == 0 &&
+            c->media_refs[i].side == (unsigned char)(side ? 1 : 0) &&
+            c->media_refs[i].field_index == f) return true;
+    return false;
 }
 
+/* Draw (or, with draw=false, just measure) the images attached to one field.
+   Space is reserved for an image whenever its texture loads, whatever the
+   animation alpha, so later content never jumps when an image fades in. */
 static float draw_card_media_images(App *a, const Card *c, Rectangle card,
-                                    int side, int field_index, float y, float alpha) {
+                                    int side, int field_index, float y,
+                                    float alpha, bool draw) {
     if (!a || !c) return y;
 
     unsigned char wanted_field = (unsigned char)(field_index < 0 ? 255 : field_index);
@@ -465,7 +473,7 @@ static float draw_card_media_images(App *a, const Card *c, Rectangle card,
         if (!t || t->id == 0) continue;
 
         const float max_w = card.width - 100.f;
-        const float max_h = 150.f;
+        const float max_h = 200.f;
         float aspect = (float)t->width / (float)t->height;
         if (aspect <= 0.f) continue;
 
@@ -479,16 +487,18 @@ static float draw_card_media_images(App *a, const Card *c, Rectangle card,
         float x = card.x + (card.width - draw_w) / 2.f;
         float img_y = y + 2.f;
 
-        Rectangle shadow = { x + 4.f, img_y + 6.f, draw_w, draw_h };
-        ui_panel(shadow, (Color){ 0, 0, 0, (unsigned char)(90 * alpha) }, RADIUS_SM);
-        DrawTexturePro(*t,
-            (Rectangle){ 0, 0, (float)t->width, (float)t->height },
-            (Rectangle){ x, img_y, draw_w, draw_h },
-            (Vector2){ 0, 0 }, 0.f,
-            anim_color_alpha(WHITE, alpha));
-        ui_outline((Rectangle){ x, img_y, draw_w, draw_h },
-                   0.04f, 6, 1.f,
-                   anim_color_alpha(TH.border_hi, alpha));
+        if (draw && alpha > 0.f) {
+            Rectangle shadow = { x + 4.f, img_y + 6.f, draw_w, draw_h };
+            ui_panel(shadow, (Color){ 0, 0, 0, (unsigned char)(90 * alpha) }, RADIUS_SM);
+            DrawTexturePro(*t,
+                (Rectangle){ 0, 0, (float)t->width, (float)t->height },
+                (Rectangle){ x, img_y, draw_w, draw_h },
+                (Vector2){ 0, 0 }, 0.f,
+                anim_color_alpha(WHITE, alpha));
+            ui_outline((Rectangle){ x, img_y, draw_w, draw_h },
+                       0.04f, 6, 1.f,
+                       anim_color_alpha(TH.border_hi, alpha));
+        }
 
         y = img_y + draw_h + 12.f;
     }
@@ -496,113 +506,139 @@ static float draw_card_media_images(App *a, const Card *c, Rectangle card,
     return y;
 }
 
-static void draw_card_content(App *a, const Card *c, Rectangle card, float alpha) {
+/*
+ * One pass over a card's content. With draw=false nothing is drawn and the
+ * return value is the y just below the last item, so the caller can size the
+ * card to its real content (and scroll it if that exceeds the window).
+ * Fields that hold only an image (e.g. a "Picture" field whose text is empty
+ * after the HTML is stripped) are laid out and drawn too.
+ */
+static float card_content_pass(App *a, const Card *c, Rectangle card,
+                               float alpha, bool revealed, bool draw) {
     bool jp = card_is_japanese(c);
     float W = card.width;
-
-    bool revealed = (S.phase == PHASE_REVEAL || S.phase == PHASE_RATED);
 
     const char *prompt = (c->field_count > 0) ? c->field_values[0] : c->front;
     if (!prompt) prompt = "";
 
     if (jp && c->field_count > 0) {
-        float w_pop = (S.phase == PHASE_REVEAL)
+        float w_pop = (draw && S.phase == PHASE_REVEAL)
             ? ease_out_back(anim_clamp01(S.phase_t / 0.28f))
             : 1.f;
-        int ws = (int)(FONT_XL * (0.82f + 0.18f * w_pop));
-        float wy = card.y + 40.f + (1.f - w_pop) * 14.f;
-        ui_text_center(prompt,
-            (Rectangle){ card.x, wy, W, (float)FONT_XL + 10 },
-            ws, anim_color_alpha(TH.text, alpha));
-
-        float y = card.y + 40.f + FONT_XL + 24.f;
-        y = draw_card_media_images(a, c, card, 0, 0, y, alpha);
+        float y;
+        if (ui_measure(prompt, FONT_XL) <= (int)(W - 60.f) && !strchr(prompt, '\n')) {
+            if (draw) {
+                int ws = (int)(FONT_XL * (0.82f + 0.18f * w_pop));
+                float wy = card.y + 40.f + (1.f - w_pop) * 14.f;
+                ui_text_center(prompt,
+                    (Rectangle){ card.x, wy, W, (float)FONT_XL + 10 },
+                    ws, anim_color_alpha(TH.text, alpha));
+            }
+            y = card.y + 40.f + FONT_XL + 24.f;
+        } else {
+            /* A long prompt (e.g. a sentence): wrap it instead of overflowing. */
+            y = ui_text_rich_layout(prompt, card.x + 30.f, card.y + 40.f, W - 60.f,
+                                    FONT_LG, anim_color_alpha(TH.text, alpha), 8,
+                                    true, draw) + 16.f;
+        }
+        y = draw_card_media_images(a, c, card, 0, 0, y, alpha, draw);
 
         if (!revealed) {
-            y = draw_card_media_images(a, c, card, 0, 255, y, alpha);
-            return;
+            y = draw_card_media_images(a, c, card, 0, 255, y, alpha, draw);
+            return y;
         }
 
         bool divider_drawn = false;
 
         for (int i = 1; i < c->field_count; i++) {
-            if (!c->field_values[i][0]) continue;
-            float rev = S.rev_field[i];
+            const char *v = c->field_values[i];
+            bool has_text = v && v[0];
+            bool has_img  = field_has_images(c, 1, i);
+            if (!has_text && !has_img) continue;     /* nothing to show */
+
+            float rev = draw ? S.rev_field[i] : 1.f;
             if (rev <= 0.f) continue;
+            float ra = anim_clamp01(rev);
 
-            float ry = y + (1.f - rev) * 10.f;
-            int  sz  = (i == 1) ? FONT_MD : FONT_SM;
-            Color col = (i == 1) ? TH.text_dim : TH.text_muted;
-
-            ui_text_center(c->field_values[i],
-                (Rectangle){ card.x + 20, ry, W - 40, 32 },
-                sz, anim_color_alpha(col, alpha * rev));
-            y += 34.f;
-            if (rev >= 0.99f) {
-                y = draw_card_media_images(a, c, card, 1, i, y, alpha * rev);
+            if (has_text) {
+                float ry = y + (1.f - ra) * 10.f;
+                int  sz  = (i == 1) ? FONT_MD : FONT_SM;
+                Color col = (i == 1) ? TH.text_dim : TH.text_muted;
+                float bottom = ui_text_rich_layout(v, card.x + 40.f, ry, W - 80.f, sz,
+                                    anim_color_alpha(col, alpha * ra), 6, true, draw);
+                y = bottom - (1.f - ra) * 10.f + 10.f;
             }
+            y = draw_card_media_images(a, c, card, 1, i, y, alpha * ra, draw);
 
-            if (i == 1 && !divider_drawn && S.rev_divider > 0.f) {
-                float dw = (W - 200.f) * S.rev_divider;
-                float dx = card.x + W/2.f - dw/2.f;
-                DrawLineEx((Vector2){ dx, y }, (Vector2){ dx + dw, y },
-                           1.5f, anim_color_alpha((Color){ 80, 92, 128, 220 },
-                                                  alpha * S.rev_divider));
-                y += 14.f;
-                divider_drawn = true;
+            if (!divider_drawn) {
+                float dv = draw ? S.rev_divider : 1.f;
+                if (dv > 0.f) {
+                    if (draw) {
+                        float dw = (W - 200.f) * dv;
+                        float dx = card.x + W/2.f - dw/2.f;
+                        DrawLineEx((Vector2){ dx, y }, (Vector2){ dx + dw, y },
+                                   1.5f, anim_color_alpha((Color){ 80, 92, 128, 220 },
+                                                          alpha * dv));
+                    }
+                    y += 14.f;
+                    divider_drawn = true;
+                }
             }
         }
-        (void)draw_card_media_images(a, c, card, 1, 255, y, alpha);
-    } else {
-        float prompt_bottom = ui_text_rich_ex(prompt,
-            (Rectangle){ card.x + 44, card.y + 40, W - 88, 200 },
-            FONT_MD, anim_color_alpha(TH.text, alpha), 8);
+        y = draw_card_media_images(a, c, card, 1, 255, y, alpha, draw);
+        return y;
+    }
 
-        prompt_bottom = draw_card_media_images(a, c, card, 0, 0, prompt_bottom + 8.f, alpha);
-        if (!revealed) {
-            (void)draw_card_media_images(a, c, card, 0, 255, prompt_bottom, alpha);
-            return;
-        }
+    /* ---- generic (non-Japanese) layout ---- */
+    float prompt_bottom = ui_text_rich_layout(prompt,
+        card.x + 44.f, card.y + 40.f, W - 88.f,
+        FONT_MD, anim_color_alpha(TH.text, alpha), 8, false, draw);
 
-        float div_y = prompt_bottom + 16.f;
-        float min_div = card.y + 200.f;
-        if (div_y < min_div) div_y = min_div;
+    prompt_bottom = draw_card_media_images(a, c, card, 0, 0, prompt_bottom + 8.f, alpha, draw);
+    if (!revealed) {
+        return draw_card_media_images(a, c, card, 0, 255, prompt_bottom, alpha, draw);
+    }
 
-        if (S.rev_divider > 0.f) {
-            float dw = (W - 100.f) * S.rev_divider;
-            float dx = card.x + W/2.f - dw/2.f;
-            DrawLineEx((Vector2){ dx, div_y }, (Vector2){ dx + dw, div_y },
-                       1.f, anim_color_alpha((Color){ 80, 92, 128, 220 },
-                                             alpha * S.rev_divider));
-        }
+    float div_y = prompt_bottom + 16.f;
+    float min_div = card.y + 200.f;
+    if (div_y < min_div) div_y = min_div;
 
-        float y = div_y + 18.f;
-        for (int i = 1; i < c->field_count; i++) {
-            if (!c->field_values[i][0]) continue;
-            float rev = S.rev_field[i];
-            if (rev <= 0.f) continue;
+    float dv = draw ? S.rev_divider : 1.f;
+    if (draw && dv > 0.f) {
+        float dw = (W - 100.f) * dv;
+        float dx = card.x + W/2.f - dw/2.f;
+        DrawLineEx((Vector2){ dx, div_y }, (Vector2){ dx + dw, div_y },
+                   1.f, anim_color_alpha((Color){ 80, 92, 128, 220 }, alpha * dv));
+    }
 
-            float ry = y + (1.f - rev) * 10.f;
+    float y = div_y + 18.f;
+    for (int i = 1; i < c->field_count; i++) {
+        const char *v = c->field_values[i];
+        bool has_text = v && v[0];
+        bool has_img  = field_has_images(c, 1, i);
+        if (!has_text && !has_img) continue;
 
+        float rev = draw ? S.rev_field[i] : 1.f;
+        if (rev <= 0.f) continue;
+        float ra = anim_clamp01(rev);
+
+        float ry = y + (1.f - ra) * 10.f;
+        if (has_text) {
             const char *fname = c->field_names[i];
             if (fname && fname[0] && strcasecmp(fname, "Back") != 0) {
-                ui_text(fname,
-                    (int)card.x + 44, (int)ry, FONT_XS,
-                    anim_color_alpha(TH.text_muted, alpha * rev));
+                if (draw)
+                    ui_text(fname, (int)card.x + 44, (int)ry, FONT_XS,
+                            anim_color_alpha(TH.text_muted, alpha * ra));
                 ry += 20.f;
             }
-
-            float bottom = ui_text_rich_ex(c->field_values[i],
-                (Rectangle){ card.x + 44, ry, W - 88, 200 },
-                FONT_SM, anim_color_alpha(TH.text_dim, alpha * rev), 6);
-
-            y = bottom + 12.f;
-            if (rev >= 0.99f) {
-                y = draw_card_media_images(a, c, card, 1, i, y, alpha * rev);
-            }
+            float bottom = ui_text_rich_layout(v, card.x + 44.f, ry, W - 88.f,
+                                FONT_SM, anim_color_alpha(TH.text_dim, alpha * ra),
+                                6, false, draw);
+            y = bottom - (1.f - ra) * 10.f + 12.f;
         }
-        (void)draw_card_media_images(a, c, card, 1, 255, y, alpha);
+        y = draw_card_media_images(a, c, card, 1, i, y, alpha * ra, draw);
     }
+    return draw_card_media_images(a, c, card, 1, 255, y, alpha, draw);
 }
 
 /* ------------------------------------------------------------------ */
@@ -653,23 +689,41 @@ void study_draw(App *a) {
     /* -------- Card geometry -------- */
     Card *c = &d->cards[s->queue[s->current]];
     bool jp = card_is_japanese(c);
-    int front_image_count = card_image_count_for_side(c, 0);
-    int back_image_count = card_image_count_for_side(c, 1);
-    float front_image_h = front_image_count > 0
-        ? 20.f + front_image_count * 162.f : 0.f;
-    float back_image_h = back_image_count > 0
-        ? 20.f + back_image_count * 162.f : 0.f;
+    bool reveal_now = (S.phase == PHASE_REVEAL || S.phase == PHASE_RATED);
 
     float cw = jp ? 780.f : 740.f;
     if (cw > W - 80) cw = W - 80;
 
-    float base_front_h = (jp ? 300.f : 260.f) + front_image_h;
-    float reveal_h = (jp ? 260.f : 320.f) + back_image_h;
-    if (c->field_count > 3) reveal_h += (c->field_count - 3) * 26.f;
-    float total_h = base_front_h + (s->revealed ? reveal_h : 0.f);
+    /* Size the card to its real content instead of guessing, then fit it into
+       the space between the header and the rating buttons. If it is still too
+       tall, the content scrolls inside the card. */
+    const float area_top = 78.f;
+    const float area_bottom = (float)H - 150.f;
+    float content_bottom = card_content_pass(a, c, (Rectangle){ 0.f, 0.f, cw, 0.f },
+                                             1.f, reveal_now, false);
+    float min_h = reveal_now ? 420.f : (jp ? 300.f : 260.f);
+    float total_h = content_bottom + 36.f;
+    if (total_h < min_h) total_h = min_h;
+    float max_h = area_bottom - area_top;
+    if (max_h < 200.f) max_h = 200.f;
+    S.scroll_max = total_h > max_h ? total_h - max_h : 0.f;
+    if (S.scroll_max > 0.f) total_h = max_h;
+
+    if (S.scroll_max > 0.f && reveal_now && !S.show_exit) {
+        S.scroll_y -= GetMouseWheelMove() * 60.f;
+        if (IsKeyDown(KEY_DOWN))      S.scroll_y += 600.f * GetFrameTime();
+        if (IsKeyDown(KEY_UP))        S.scroll_y -= 600.f * GetFrameTime();
+        if (IsKeyPressed(KEY_PAGE_DOWN)) S.scroll_y += max_h * 0.8f;
+        if (IsKeyPressed(KEY_PAGE_UP))   S.scroll_y -= max_h * 0.8f;
+    }
+    if (S.scroll_y > S.scroll_max) S.scroll_y = S.scroll_max;
+    if (S.scroll_y < 0.f) S.scroll_y = 0.f;
 
     float cx = W/2.f + S.enter_x + S.exit_x + S.tilt_x * 14.f;
-    float cy = H/2.f - 90.f + S.exit_y + S.tilt_y * 12.f;
+    float top_y = (H/2.f - 90.f) - total_h / 2.f;          /* keep the old centring...   */
+    if (top_y > area_bottom - total_h) top_y = area_bottom - total_h;
+    if (top_y < area_top) top_y = area_top;                 /* ...but never off-screen    */
+    float cy = top_y + total_h / 2.f + S.exit_y + S.tilt_y * 12.f;
 
     float scale = 1.f;
     if (S.phase == PHASE_ENTER) {
@@ -714,7 +768,25 @@ void study_draw(App *a) {
 
 
 
-    draw_card_content(a, c, card, alpha);
+    {
+        Rectangle origin = card;
+        origin.y -= S.scroll_y;
+        bool clip = S.scroll_max > 0.f;
+        if (clip) BeginScissorMode((int)card.x + 2, (int)card.y + 2,
+                                   (int)card.width - 4, (int)card.height - 4);
+        (void)card_content_pass(a, c, origin, alpha, reveal_now, true);
+        if (clip) EndScissorMode();
+
+        if (clip && reveal_now) {
+            float track_h = card.height - 24.f;
+            float thumb_h = track_h * (card.height / (card.height + S.scroll_max));
+            if (thumb_h < 30.f) thumb_h = 30.f;
+            float thumb_y = card.y + 12.f +
+                (track_h - thumb_h) * (S.scroll_y / S.scroll_max);
+            ui_panel((Rectangle){ card.x + card.width - 9.f, thumb_y, 4.f, thumb_h },
+                     anim_color_alpha(TH.border_hi, alpha * 0.8f), 2.f);
+        }
+    }
 
     if (S.combo >= 2 && S.phase != PHASE_RATED) {
         float cs = S.combo_scale.value;

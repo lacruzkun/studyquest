@@ -89,6 +89,8 @@ void app_update(App *a, float dt);
 void app_draw(App *a);
 
 void app_save(App *a);
+/* Same, but reports whether the save file was actually written. */
+bool app_save_checked(App *a);
 void app_goto(App *a, Screen s);
 void app_toast(App *a, const char *msg, Color c);
 void app_start_session(App *a, int deck_id);

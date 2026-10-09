@@ -70,6 +70,7 @@ void app_destroy(App *a) {
 }
 
 void app_save(App *a) { save_write(&a->data, a->save_path); }
+bool app_save_checked(App *a) { return save_write(&a->data, a->save_path); }
 
 void app_goto(App *a, Screen s) {
     if (a->screen == s) return;

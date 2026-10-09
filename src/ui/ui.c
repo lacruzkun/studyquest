@@ -356,6 +356,103 @@ float ui_text_rich_ex(const char *t, Rectangle r, int size, Color c, int line_ga
     return y + line_h;
 }
 
+/* Lay out rich text (bold/underline/<br>/newlines) wrapped to `width`, with
+   word-aware line breaking. Each line is centred when `center` is set. When
+   `draw` is false nothing is drawn: the call only measures, so callers can size
+   a container to its real content. Unlike ui_text_rich_ex it never truncates at
+   a rectangle height. Returns the y just below the last line. */
+typedef struct {
+    uint32_t cp;
+    char     ch[5];
+    float    w;
+    bool     bold, ul, brk;
+} RichGlyph;
+
+#define RICH_LAYOUT_MAX_GLYPHS 30000
+
+float ui_text_rich_layout(const char *t, float x, float y, float width, int size,
+                          Color c, int line_gap, bool center, bool draw) {
+    if (!t || !*t || width <= 0.f) return y;
+
+    RichRun *runs = (RichRun *)malloc(sizeof(RichRun) * MAX_RICH_RUNS);
+    if (!runs) return y;
+    int nruns = rich_parse(t, runs, MAX_RICH_RUNS);
+
+    size_t cap = 0;
+    for (int i = 0; i < nruns; i++) cap += runs[i].forced_break ? 1 : (size_t)runs[i].len;
+    if (cap == 0) { free(runs); return y; }
+    if (cap > RICH_LAYOUT_MAX_GLYPHS) cap = RICH_LAYOUT_MAX_GLYPHS;
+    RichGlyph *g = (RichGlyph *)malloc(sizeof(RichGlyph) * cap);
+    if (!g) { free(runs); return y; }
+
+    int gn = 0;
+    for (int i = 0; i < nruns && gn < (int)cap; i++) {
+        RichRun *run = &runs[i];
+        if (run->forced_break) { memset(&g[gn], 0, sizeof(g[gn])); g[gn++].brk = true; continue; }
+        const char *p = run->text;
+        while (*p && gn < (int)cap) {
+            uint32_t cp = 0;
+            size_t dl = next_utf8(p, &cp);
+            if (!dl) break;
+            RichGlyph *e = &g[gn++];
+            memset(e, 0, sizeof(*e));
+            e->cp = cp;
+            size_t cpy = dl < sizeof(e->ch) - 1 ? dl : sizeof(e->ch) - 1;
+            memcpy(e->ch, p, cpy);
+            e->w = MeasureTextEx(pick_cp(size, cp), e->ch, (float)size, 0.5f).x;
+            e->bold = run->bold;
+            e->ul = run->underline;
+            p += dl;
+        }
+    }
+    while (gn > 0 && g[gn - 1].brk) gn--;      /* trailing <br> adds no blank line */
+
+    const float line_h = (float)(size + line_gap);
+    float cy = y;
+    int i = 0;
+    while (i < gn) {
+        int start = i, j = i, last_space = -1;
+        float lw = 0.f;
+        while (j < gn && !g[j].brk) {
+            if (lw + g[j].w > width && j > start) break;
+            if (g[j].cp == ' ') last_space = j;
+            lw += g[j].w;
+            j++;
+        }
+        int end = j, next = j;
+        if (j < gn && g[j].brk)              next = j + 1;             /* forced break */
+        else if (j < gn) {                                              /* soft wrap */
+            if (last_space > start) { end = last_space; next = last_space + 1; }
+            else                    { next = j; }
+        }
+        while (end > start && g[end - 1].cp == ' ') end--;
+
+        if (draw && end > start) {
+            float w = 0.f;
+            for (int k = start; k < end; k++) w += g[k].w;
+            float px = center ? x + (width - w) / 2.f : x;
+            for (int k = start; k < end; k++) {
+                if (g[k].cp != ' ') {
+                    Font f = pick_cp(size, g[k].cp);
+                    DrawTextEx(f, g[k].ch, (Vector2){ px, cy }, (float)size, 0.5f, c);
+                    if (g[k].bold)
+                        DrawTextEx(f, g[k].ch, (Vector2){ px + 0.7f, cy }, (float)size, 0.5f, c);
+                }
+                if (g[k].ul)
+                    DrawLineEx((Vector2){ px, cy + size + 1.f },
+                               (Vector2){ px + g[k].w, cy + size + 1.f }, 1.5f, c);
+                px += g[k].w;
+            }
+        }
+        cy += line_h;
+        i = next > start ? next : start + 1;
+    }
+
+    free(g);
+    free(runs);
+    return cy;
+}
+
 void ui_text_rich(const char *t, Rectangle r, int size, Color c, int line_gap) {
     (void)ui_text_rich_ex(t, r, size, c, line_gap);
 }

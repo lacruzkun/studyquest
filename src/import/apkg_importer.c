@@ -1,7 +1,8 @@
 /* apkg_importer.c */
 #include "import/apkg_importer.h"
+#include "import/zip_stream.h"
+#include "import/pb_reader.h"
 #include "miniz.h"
-#include "zstd.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,12 +12,12 @@
 #include <errno.h>
 
 /* Untrusted-input guards. Anki packages are normally a few MB; these caps
-   exist purely to stop hostile/corrupt archives from exhausting memory. */
-#define APKG_MAX_ARCHIVE_ENTRIES         1000000u
-#define APKG_MAX_COLLECTION_RAW          (512ull * 1024 * 1024)   /* .anki2/.anki21 */
-#define APKG_MAX_COLLECTION_ZSTD_COMP    (512ull * 1024 * 1024)   /* .anki21b, compressed */
-#define APKG_MAX_COLLECTION_ZSTD_DECOMP  (2ull * 1024 * 1024 * 1024)
-#define APKG_MAX_MEDIA_MAP               (32ull * 1024 * 1024)
+   exist purely to stop hostile/corrupt archives from exhausting memory or
+   disk. Everything is streamed, so a cap is a limit on *output* bytes. */
+#define APKG_MAX_ARCHIVE_ENTRIES   1000000u
+#define APKG_MAX_COLLECTION_BYTES  (1ull << 30)          /* decoded collection */
+#define APKG_MAX_MEDIA_MAP         (32ull * 1024 * 1024)
+#define APKG_MAX_META_BYTES        4096u
 
 /* --- small helpers ---------------------------------------------- */
 
@@ -36,17 +37,16 @@ static bool mkdir_p(const char *path) {
     for (char *p = buf + 1; *p; p++) {
         if (*p == '/') {
             *p = 0;
-            if (mkdir(buf, 0755) != 0 && errno != EEXIST) return false;
+            if (mkdir(buf, 0700) != 0 && errno != EEXIST) return false;
             *p = '/';
         }
     }
-    if (mkdir(buf, 0755) != 0 && errno != EEXIST) return false;
+    if (mkdir(buf, 0700) != 0 && errno != EEXIST) return false;
     return true;
 }
 
-/* Reject any archive entry whose name contains a path traversal.
-   Anki archive entries are flat (0, 1, collection.anki2, media, meta),
-   so anything with a slash or .. is either malicious or unexpected. */
+/* Anki archive entries are flat (0, 1, collection.anki2, media, meta), so
+   anything with a slash or .. is either malicious or unexpected. */
 static bool safe_entry_name(const char *name) {
     if (!name || !*name) return false;
     if (name[0] == '/' || name[0] == '\\') return false;
@@ -55,73 +55,39 @@ static bool safe_entry_name(const char *name) {
     return true;
 }
 
-/* Extract one archive entry to disk. Returns the number of bytes written,
-   or -1 on failure. Rejects entries larger than `max_size` before allocating. */
-static bool entry_uncompressed_size(mz_zip_archive *zip, const char *name,
-                                    uint64_t *out) {
-    int idx = mz_zip_reader_locate_file(zip, name, NULL, 0);
-    if (idx < 0) return false;
-    mz_zip_archive_file_stat st;
-    if (!mz_zip_reader_file_stat(zip, idx, &st)) return false;
-    *out = st.m_uncomp_size;
-    return true;
-}
-
-static long extract_entry_to_file(mz_zip_archive *zip, const char *entry_name,
-                                  const char *dest_path, uint64_t max_size) {
-    uint64_t usz = 0;
-    if (!entry_uncompressed_size(zip, entry_name, &usz) || usz > max_size)
-        return -1;
-
-    size_t size = 0;
-    void *data = mz_zip_reader_extract_file_to_heap(zip, entry_name, &size, 0);
-    if (!data) return -1;
-
+/* Stream one entry to `dest_path`. Removes the partial file on failure. */
+static ZipStreamStatus extract_entry(mz_zip_archive *zip, const char *entry,
+                                     bool zstd, uint64_t cap,
+                                     const char *dest_path, uint64_t *bytes) {
     FILE *f = fopen(dest_path, "wb");
-    if (!f) { mz_free(data); return -1; }
-    size_t written = fwrite(data, 1, size, f);
-    fclose(f);
-    mz_free(data);
-
-    if (written != size) return -1;
-    return (long)size;
+    if (!f) return ZS_IO;
+    ZipStreamStatus st = zs_extract_to_file((struct mz_zip_archive_tag *)zip,
+                                            entry, zstd, cap, f, bytes);
+    if (fclose(f) != 0 && st == ZS_OK) st = ZS_IO;
+    if (st != ZS_OK) remove(dest_path);
+    return st;
 }
 
-/* Extract one entry, zstd-decompress it, write the result. */
-static long extract_entry_zstd_to_file(mz_zip_archive *zip, const char *entry_name,
-                                       const char *dest_path) {
-    uint64_t usz = 0;
-    if (!entry_uncompressed_size(zip, entry_name, &usz) ||
-        usz > APKG_MAX_COLLECTION_ZSTD_COMP)
-        return -1;
-
-    size_t size = 0;
-    void *data = mz_zip_reader_extract_file_to_heap(zip, entry_name, &size, 0);
-    if (!data) return -1;
-
-    unsigned long long decompressed_size = ZSTD_getFrameContentSize(data, size);
-    if (decompressed_size == ZSTD_CONTENTSIZE_ERROR ||
-        decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN ||
-        decompressed_size > APKG_MAX_COLLECTION_ZSTD_DECOMP) {
-        mz_free(data);
-        return -1;
+/* The `meta` file is a tiny protobuf: PackageMetadata { Version version = 1 }
+   with VERSION_LEGACY_1 = 1, VERSION_LEGACY_2 = 2, VERSION_LATEST = 3. */
+static int read_meta_version(mz_zip_archive *zip) {
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    if (zs_extract_to_mem((struct mz_zip_archive_tag *)zip, "meta", false,
+                          APKG_MAX_META_BYTES, &buf, &len) != ZS_OK)
+        return 0;
+    int version = 0;
+    PbReader r;
+    PbField f;
+    pb_init(&r, buf, len);
+    while (pb_next(&r, &f)) {
+        if (f.field == 1 && f.wire == 0 && f.varint <= 1000) {
+            version = (int)f.varint;
+            break;
+        }
     }
-
-    void *out = malloc((size_t)decompressed_size);
-    if (!out) { mz_free(data); return -1; }
-
-    size_t got = ZSTD_decompress(out, (size_t)decompressed_size, data, size);
-    mz_free(data);
-
-    if (ZSTD_isError(got)) { free(out); return -1; }
-
-    FILE *f = fopen(dest_path, "wb");
-    if (!f) { free(out); return -1; }
-    size_t written = fwrite(out, 1, got, f);
-    fclose(f);
-    free(out);
-
-    return written == got ? (long)got : -1;
+    free(buf);
+    return version;
 }
 
 /* --- public API -------------------------------------------------- */
@@ -162,6 +128,8 @@ bool apkg_open(const char *apkg_path, const char *tmp_dir, ApkgHandle *out) {
         return false;
     }
 
+    out->meta_version = read_meta_version(&zip);
+
     /* Look for the three possible collection filenames. The order matters:
        we prefer the newest variant first so that a package containing both
        a real collection.anki21 and a dummy collection.anki2 is handled
@@ -175,11 +143,9 @@ bool apkg_open(const char *apkg_path, const char *tmp_dir, ApkgHandle *out) {
         out->variant = APKG_VARIANT_MODERN;
     } else if (mz_zip_reader_locate_file(&zip, "collection.anki21", NULL, 0) >= 0) {
         real_db_entry = "collection.anki21";
-        real_db_is_zstd = false;
         out->variant = APKG_VARIANT_LEGACY2;
     } else if (mz_zip_reader_locate_file(&zip, "collection.anki2", NULL, 0) >= 0) {
         real_db_entry = "collection.anki2";
-        real_db_is_zstd = false;
         out->variant = APKG_VARIANT_LEGACY1;
     } else {
         snprintf(out->error, sizeof(out->error),
@@ -190,39 +156,41 @@ bool apkg_open(const char *apkg_path, const char *tmp_dir, ApkgHandle *out) {
         return false;
     }
 
-    /* Extract the real collection. */
+    /* In the latest package format (meta version 3) every media file is
+       also a zstd frame. */
+    out->media_zstd = (out->meta_version >= 3) ||
+                      (out->variant == APKG_VARIANT_MODERN);
+
+    /* Extract the real collection (streamed; zstd frames from Anki carry no
+       decompressed size, so we cannot size a buffer up front). */
     snprintf(out->db_path, sizeof(out->db_path),
              "%s/%s", tmp_dir, real_db_entry);
 
-    long n;
-    if (real_db_is_zstd) {
-        n = extract_entry_zstd_to_file(&zip, real_db_entry, out->db_path);
-        if (n < 0) {
+    uint64_t n = 0;
+    ZipStreamStatus st = extract_entry(&zip, real_db_entry, real_db_is_zstd,
+                                       APKG_MAX_COLLECTION_BYTES, out->db_path, &n);
+    if (st != ZS_OK || n == 0) {
+        if (st == ZS_OK) remove(out->db_path);
+        if (real_db_is_zstd) {
             snprintf(out->error, sizeof(out->error),
-                     "Failed to decompress %s. The zstd stream may be "
-                     "corrupt.", real_db_entry);
-            mz_zip_reader_end(&zip);
-            return false;
-        }
-    } else {
-        n = extract_entry_to_file(&zip, real_db_entry, out->db_path,
-                                  APKG_MAX_COLLECTION_RAW);
-        if (n < 0) {
+                     "Failed to decompress %s (%s).", real_db_entry,
+                     st == ZS_OK ? "empty collection" : zs_status_str(st));
+        } else {
             snprintf(out->error, sizeof(out->error),
-                     "Failed to extract %s from the archive.", real_db_entry);
-            mz_zip_reader_end(&zip);
-            return false;
+                     "Failed to extract %s from the archive (%s).", real_db_entry,
+                     st == ZS_OK ? "empty collection" : zs_status_str(st));
         }
+        out->db_path[0] = 0;
+        mz_zip_reader_end(&zip);
+        return false;
     }
 
     /* Extract the media map, if present. Absence is not an error. */
     if (mz_zip_reader_locate_file(&zip, "media", NULL, 0) >= 0) {
-        snprintf(out->media_json_path, sizeof(out->media_json_path),
-                 "%s/media", tmp_dir);
-        if (extract_entry_to_file(&zip, "media", out->media_json_path,
-                                  APKG_MAX_MEDIA_MAP) < 0) {
-            out->media_json_path[0] = 0;
-        }
+        char mp[600];
+        snprintf(mp, sizeof(mp), "%s/media", tmp_dir);
+        if (extract_entry(&zip, "media", false, APKG_MAX_MEDIA_MAP, mp, NULL) == ZS_OK)
+            snprintf(out->media_json_path, sizeof(out->media_json_path), "%s", mp);
     }
 
     /* Count media entries by iterating the archive. Media files are the
@@ -231,11 +199,11 @@ bool apkg_open(const char *apkg_path, const char *tmp_dir, ApkgHandle *out) {
        parsed media map, so we don't waste disk on unreferenced files. */
     mz_uint total = mz_zip_reader_get_num_files(&zip);
     for (mz_uint i = 0; i < total; i++) {
-        mz_zip_archive_file_stat st;
-        if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
-        if (!safe_entry_name(st.m_filename)) continue;
+        mz_zip_archive_file_stat fs;
+        if (!mz_zip_reader_file_stat(&zip, i, &fs)) continue;
+        if (!safe_entry_name(fs.m_filename)) continue;
         bool numeric = true;
-        for (const char *p = st.m_filename; *p; p++) {
+        for (const char *p = fs.m_filename; *p; p++) {
             if (*p < '0' || *p > '9') { numeric = false; break; }
         }
         if (numeric) out->media_entry_count++;

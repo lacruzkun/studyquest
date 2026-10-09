@@ -11,4 +11,8 @@ bool anki_parse(const char *db_path, AnkiCollection *out);
 
 void anki_collection_free(AnkiCollection *c);
 
+/* Build (or rebuild) the sorted note-id index that makes anki_find_note()
+   O(log n). anki_parse() calls this; hand-built collections may too. */
+void anki_collection_index_notes(AnkiCollection *c);
+
 #endif

@@ -18,6 +18,7 @@ typedef struct {
     char    name[MAX_DECK_NAME];
     int     card_count;
     int     note_count;
+    bool    name_shortened;    /* the Anki name did not fit and was abbreviated */
 } ImportDeckSummary;
 
 typedef struct {
@@ -29,7 +30,8 @@ typedef struct {
    template features, etc.) shown on the import result screen. */
 typedef struct {
     char message[IMPORT_WARNING_CAP];
-    int  count;
+    int  count;      /* warnings stored in `message` */
+    int  dropped;    /* warnings that did not fit in `message` */
 } ImportWarnings;
 
 /* Group the cards in `col` by deck id, computing a per-deck name (full "::"
@@ -60,17 +62,27 @@ void import_warnings_init(ImportWarnings *w);
 void import_warnings_addf(ImportWarnings *w, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
-/* Fold a media import result into warnings (missing files and unsafe names
-   are recoverable, not fatal). */
+/* Fold a media import result into warnings (missing files, unsafe names,
+   oversized or undecodable files are recoverable, not fatal). */
 void import_warn_media(ImportWarnings *w, const MediaImportResult *mr);
 
 /* ----------------------- scheduling ------------------------------ */
 
-/* Convert an Anki card's scheduling state into StudyQuest SRS fields.
-   Preserves ease (factor), reps, lapses, interval (ivl) and state (type).
-   `due` is reset to "now" (immediately studyable) because Anki's due values
-   use a different day-number scheme; maturity is preserved so StudyQuest's
-   scheduler continues from the correct interval/ease. */
+/* Convert an Anki card's scheduling state into StudyQuest SRS fields:
+   ease (factor), reps, lapses, interval (ivl) and state (type) are carried
+   over, and the due date is preserved.
+
+   Anki stores `due` three different ways depending on the card:
+     - new cards:             a queue position (meaningless here -> due now)
+     - learning cards:        epoch seconds
+     - review/day-learning:   whole days counted from the collection's
+                              creation time (`crt`)
+   `crt` is the collection creation time (AnkiCollection.crt). When it is 0
+   (unknown) review cards fall back to "due now". `now` is epoch seconds. */
+void import_apply_scheduling_ex(const AnkiCard *ac, int64_t crt, double now,
+                                Card *out);
+
+/* Same, with crt unknown: every card becomes due immediately. */
 void import_apply_scheduling(const AnkiCard *ac, Card *out);
 
 /* ----------------------- duplicates / commit --------------------- */
@@ -81,12 +93,31 @@ typedef enum {
 } ImportMode;
 
 /* Find a deck in `dl` by exact name, or NULL. */
-Deck *import_find_existing_deck(DeckList *dl, const char *name);
+Deck *import_find_existing_deck(const DeckList *dl, const char *name);
 
-/* Move the decks built into `scratch` into `app`. In UPDATE mode, cards
-   whose Anki id already exists in a same-named deck are skipped (not
-   duplicated). `scratch` is emptied either way; `app` is left consistent.
-   Always returns true (failures are recorded as warnings). */
+/* What a commit did. */
+typedef struct {
+    int  decks_created;
+    int  decks_merged;
+    int  cards_added;
+    int  cards_skipped_duplicate;
+    int  first_deck_id;                 /* app deck id of the first imported deck */
+    char first_deck_name[MAX_DECK_NAME];
+} ImportCommitResult;
+
+/* Move the decks built into `scratch` into `app`, all-or-nothing. In UPDATE
+   mode, cards whose Anki id already exists in a same-named deck are skipped
+   (not duplicated).
+
+   Success: scratch is emptied. Failure (not enough deck slots, a deck would
+   exceed its card limit, out of memory): `app` is left exactly as it was
+   (new decks removed, merged cards truncated away), a warning explains why,
+   and `scratch` must still be released with decklist_free(). `res` may be
+   NULL. */
+bool import_commit_ex(DeckList *app, DeckList *scratch, ImportMode mode,
+                      ImportWarnings *w, ImportCommitResult *res);
+
+/* Convenience wrapper without the result. */
 bool import_commit(DeckList *app, DeckList *scratch, ImportMode mode,
                    ImportWarnings *w);
 
@@ -108,17 +139,26 @@ typedef struct {
     int                       next_card;     /* index into col->cards */
     int                       cards_done;
     int                       cards_added;
-    int                       notes_added;   /* distinct note ids */
-    int64_t                  *seen_notes;
-    int                       seen_note_count;
-    int                       seen_note_cap;
+    int                       notes_added;   /* distinct notes */
+    unsigned char            *note_seen;     /* one flag per col->notes entry */
+
+    /* Per-category tallies, folded into single warnings when the job ends so
+       a bad 50k-card deck cannot flood the warning list. */
+    int                       skipped_unknown_deck;
+    int                       skipped_unconvertible;
+    int                       skipped_deck_full;
+    int                       cards_with_missing_media;
+    int                       suspended_cards;
+    bool                      summarized;
 
     /* Model ids we've already emitted a template/cloze warning about. */
     int64_t                   warned_models[32];
     int                       warned_model_count;
 } ImportJob;
 
-/* Reset and bind the job. `target` is where decks/cards are written. */
+/* Reset and bind the job. `target` is where decks/cards are written. If
+   `media` is given, its warnings (missing/oversized/undecodable files) are
+   added to the job's warning list right away. */
 void import_job_init(ImportJob *j, const AnkiCollection *col,
                      const MediaImportResult *media, DeckList *target);
 

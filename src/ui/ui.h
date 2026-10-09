@@ -27,6 +27,12 @@ void ui_outline(Rectangle r, float roundness, int segments, float thickness, Col
    just below the last line drawn, so callers can stack content below.
    ui_text_rich() is a thin wrapper that discards the return value. */
 float ui_text_rich_ex(const char *t, Rectangle r, int size, Color c, int line_gap);
+
+/* Wrapped (word-aware) rich text that can be measured without drawing and
+   never truncates. `center` centres each line; `draw`=false only measures.
+   Returns the y just below the last line. */
+float ui_text_rich_layout(const char *t, float x, float y, float width, int size,
+                          Color c, int line_gap, bool center, bool draw);
 void  ui_text_rich(const char *t, Rectangle r, int size, Color c, int line_gap);
 
 bool ui_button(Rectangle r, const char *label, Color bg, Color text_col);

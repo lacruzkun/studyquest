@@ -284,6 +284,7 @@ add_executable(studyquest_anki_import_tests
   ${CMAKE_SOURCE_DIR}/src/import/anki_json.c
   ${CMAKE_SOURCE_DIR}/src/import/anki_convert.c
   ${CMAKE_SOURCE_DIR}/src/import/apkg_importer.c
+  ${CMAKE_SOURCE_DIR}/src/import/zip_stream.c
   ${CMAKE_SOURCE_DIR}/src/import/media_importer.c
   ${CMAKE_SOURCE_DIR}/src/import/import_manager.c
   ${CMAKE_SOURCE_DIR}/src/cards/cards.c

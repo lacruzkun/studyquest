@@ -1,5 +1,6 @@
 #include "save.h"
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -295,7 +296,11 @@ static bool read_player(FILE *f, Player *p) {
 /* ---- public ------------------------------------------------------- */
 
 bool save_write(const SaveData *d, const char *path) {
-    FILE *f = fopen(path, "wb");
+    /* Write to a temp file next to the real one and rename it into place, so
+       a crash or full disk can never leave the player with a truncated save. */
+    char tmp[1100];
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)) return false;
+    FILE *f = fopen(tmp, "wb");
     if (!f) return false;
     bool ok = true;
     ok &= w_u32(f, SAVE_MAGIC);
@@ -304,8 +309,12 @@ bool save_write(const SaveData *d, const char *path) {
     ok &= w_i32(f, d->decks.next_id);
     for (int i = 0; ok && i < d->decks.count; i++) ok &= write_deck(f, &d->decks.decks[i]);
     ok &= write_player(f, &d->player);
-    fclose(f);
-    return ok;
+    ok &= (fflush(f) == 0);
+    if (ok) fsync(fileno(f));
+    ok &= (fclose(f) == 0);
+    if (!ok) { remove(tmp); return false; }
+    if (rename(tmp, path) != 0) { remove(tmp); return false; }
+    return true;
 }
 
 bool save_load(SaveData *out, const char *path) {
