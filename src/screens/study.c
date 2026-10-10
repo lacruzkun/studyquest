@@ -227,6 +227,7 @@ static void apply_rating_and_start_exit(App *a, int rating) {
     Card *c = &d->cards[card_idx];
     double now = (double)time(NULL);
     bool was_new = (c->state == CARD_NEW);
+    bool was_due = scheduler_card_due(c, now);   /* must be read BEFORE scheduler_apply */
 
     scheduler_apply(c, (Rating)rating, now);
     player_on_review(&a->data.player, rating, was_new);
@@ -241,6 +242,22 @@ static void apply_rating_and_start_exit(App *a, int rating) {
     int lvl_before = a->data.player.level;
     player_add_xp(&a->data.player, xp);
     player_add_coins(&a->data.player, coins);
+
+    /* World progression: the single integration point. Credit is the same
+     * review XP just awarded above; one-time level rewards are granted
+     * through the existing Player API. Reward XP is NOT fed back as credit. */
+    {
+        WorldReviewEvent wev = {
+            .deck_id = s->deck_id, .card_id = c->id, .rating = rating,
+            .was_new = was_new, .was_due = was_due, .xp = xp,
+            .day = a->data.player.today_day
+        };
+        WorldReward wr;
+        world_on_review(&a->data.world, &wev, &wr);
+        if (wr.xp > 0)    player_add_xp(&a->data.player, wr.xp);
+        if (wr.coins > 0) player_add_coins(&a->data.player, wr.coins);
+    }
+
     if (a->data.player.level > lvl_before) {
         a->levelup_to = a->data.player.level;
         a->levelup_t = 2.6f;

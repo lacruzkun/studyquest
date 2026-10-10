@@ -15,6 +15,30 @@ static void app_media_root(char *out, size_t cap) {
     snprintf(out, cap, "%s/.studyquest/media", home);
 }
 
+/* One-time safety copy of a pre-world save before the first v9 write, so a
+ * player can always roll back to the previous version of the game. Never
+ * overwrites an existing backup. Failure is non-fatal. */
+static void backup_legacy_save(const char *path, int ver) {
+    if (ver <= 0 || ver >= SAVE_VERSION) return;
+    char dst[600];
+    snprintf(dst, sizeof(dst), "%s.v%d.bak", path, ver);
+    FILE *chk = fopen(dst, "rb");
+    if (chk) { fclose(chk); return; }
+    FILE *in = fopen(path, "rb");
+    if (!in) return;
+    FILE *out = fopen(dst, "wb");
+    if (!out) { fclose(in); return; }
+    char buf[4096];
+    size_t n;
+    bool ok = true;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+        if (fwrite(buf, 1, n, out) != n) { ok = false; break; }
+    fclose(in);
+    if (fclose(out) != 0) ok = false;
+    if (!ok) remove(dst);
+    else TraceLog(LOG_INFO, "SAVE: backed up v%d save to %s", ver, dst);
+}
+
 App *app_create(void) {
     App *a = (App *)RL_CALLOC(1, sizeof(App));
     if (!a) {
@@ -27,6 +51,7 @@ App *app_create(void) {
         save_defaults(&a->data);
         a->screen = SCREEN_WELCOME;
     } else {
+        backup_legacy_save(a->save_path, a->data.loaded_version);
         a->screen = SCREEN_DASHBOARD;
     }
     a->prev_screen = a->screen;

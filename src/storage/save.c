@@ -293,6 +293,27 @@ static bool read_player(FILE *f, Player *p) {
     #undef RP64
 }
 
+/* ---- world block (v9+) -------------------------------------------- */
+/* Length-prefixed so a damaged or unrecognised block can be detected and
+ * replaced with legacy-derived progress WITHOUT failing the whole load
+ * (a failed load would make the app fall back to defaults and eventually
+ * overwrite the player's save). */
+
+static bool write_world(FILE *f, const WorldProgress *w) {
+    uint8_t buf[WORLD_SERIAL_MAX];
+    size_t n = world_serialize(w, buf, sizeof(buf));
+    if (n == 0) return false;
+    return w_u32(f, (uint32_t)n) && w_bytes(f, buf, n);
+}
+
+static bool read_world(FILE *f, WorldProgress *w) {
+    uint32_t n;
+    uint8_t buf[WORLD_SERIAL_MAX];
+    if (!r_u32(f, &n) || n == 0 || n > sizeof(buf)) return false;
+    if (!r_bytes(f, buf, n)) return false;
+    return world_deserialize(w, buf, n);
+}
+
 /* ---- public ------------------------------------------------------- */
 
 bool save_write(const SaveData *d, const char *path) {
@@ -309,6 +330,7 @@ bool save_write(const SaveData *d, const char *path) {
     ok &= w_i32(f, d->decks.next_id);
     for (int i = 0; ok && i < d->decks.count; i++) ok &= write_deck(f, &d->decks.decks[i]);
     ok &= write_player(f, &d->player);
+    ok &= write_world(f, &d->world);
     ok &= (fflush(f) == 0);
     if (ok) fsync(fileno(f));
     ok &= (fclose(f) == 0);
@@ -341,8 +363,18 @@ bool save_load(SaveData *out, const char *path) {
     Player p;
     if (!read_player(f, &p)) { fclose(f); return false; }
 
+    /* World progression. v9+ stores it; anything else (older save, or a
+     * damaged block) is rebuilt from the lifetime counters. */
+    WorldProgress w;
+    bool have_world = (ver >= 9) && read_world(f, &w);
+    if (!have_world)
+        world_init_from_legacy(&w, p.total_easy, p.total_good,
+                               p.total_reviews, p.total_correct);
+
     fclose(f);
     out->player = p;
+    out->world = w;
+    out->loaded_version = (int)ver;
     return true;
 }
 
@@ -350,6 +382,8 @@ void save_defaults(SaveData *out) {
     decklist_init_sample(&out->decks);
     player_init(&out->player);
     player_roll_daily_quests(&out->player, 0xC0FFEE);
+    world_init(&out->world);
+    out->loaded_version = 0;
 }
 
 void save_default_path(char *out, size_t cap) {

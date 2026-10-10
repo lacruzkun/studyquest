@@ -260,6 +260,8 @@ add_executable(studyquest_tests
   ${CMAKE_SOURCE_DIR}/src/study/scheduler.c
   ${CMAKE_SOURCE_DIR}/src/player/player.c
   ${CMAKE_SOURCE_DIR}/src/player/achievements.c
+  ${CMAKE_SOURCE_DIR}/src/world/world_data.c
+  ${CMAKE_SOURCE_DIR}/src/world/world_progress.c
 )
 target_include_directories(studyquest_tests PRIVATE
   ${CMAKE_SOURCE_DIR}/src
@@ -292,6 +294,8 @@ add_executable(studyquest_anki_import_tests
   ${CMAKE_SOURCE_DIR}/src/player/player.c
   ${CMAKE_SOURCE_DIR}/src/player/achievements.c
   ${CMAKE_SOURCE_DIR}/src/study/scheduler.c
+  ${CMAKE_SOURCE_DIR}/src/world/world_data.c
+  ${CMAKE_SOURCE_DIR}/src/world/world_progress.c
 )
 target_include_directories(studyquest_anki_import_tests PRIVATE
   ${CMAKE_SOURCE_DIR}/src
@@ -321,7 +325,32 @@ target_link_libraries(studyquest_anki_import_tests PRIVATE
   ${SQ_CJSON_TARGET}
   m Threads::Threads)
 
+# World progression: data model, rules, anti-farm, persistence, v8 migration.
+add_executable(studyquest_world_tests
+  ${CMAKE_SOURCE_DIR}/tests/test_world.c
+  ${CMAKE_SOURCE_DIR}/tests/test_raylib_stubs.c
+  ${CMAKE_SOURCE_DIR}/src/cards/cards.c
+  ${CMAKE_SOURCE_DIR}/src/storage/save.c
+  ${CMAKE_SOURCE_DIR}/src/core/utf8.c
+  ${CMAKE_SOURCE_DIR}/src/study/scheduler.c
+  ${CMAKE_SOURCE_DIR}/src/player/player.c
+  ${CMAKE_SOURCE_DIR}/src/player/achievements.c
+  ${CMAKE_SOURCE_DIR}/src/world/world_data.c
+  ${CMAKE_SOURCE_DIR}/src/world/world_progress.c
+)
+target_include_directories(studyquest_world_tests PRIVATE
+  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/third_party)
+if(RAYLIB_PC_FOUND)
+  target_include_directories(studyquest_world_tests PRIVATE ${RAYLIB_PC_INCLUDE_DIRS})
+elseif(RAYLIB_INCLUDE_DIR)
+  target_include_directories(studyquest_world_tests PRIVATE ${RAYLIB_INCLUDE_DIR})
+endif()
+target_link_libraries(studyquest_world_tests PRIVATE m Threads::Threads)
+
 enable_testing()
 add_test(NAME studyquest_core_tests COMMAND studyquest_tests)
+add_test(NAME studyquest_world_tests
+  COMMAND studyquest_world_tests ${CMAKE_SOURCE_DIR}/tests/fixtures/save_v8_legacy.sav)
 add_test(NAME studyquest_anki_import_tests
   COMMAND studyquest_anki_import_tests ${CMAKE_SOURCE_DIR}/tests/fixtures/anki_media.apkg)
